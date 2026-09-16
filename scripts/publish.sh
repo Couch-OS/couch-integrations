@@ -71,6 +71,9 @@ PY
         -v "$root/keys/couch-integrations.rsa.pub:/couch-integrations.rsa.pub:ro" \
         alpine:3.21 sh -ec '
             apk add --no-cache alpine-sdk binutils jq >/dev/null
+            # abuild creates its own intermediate index and must trust our
+            # public key inside this disposable packaging container.
+            cp /couch-integrations.rsa.pub /etc/apk/keys/
             /src/tools/integrations/build-apk.sh "$1" "$2" \
               "/out/payload/$3" "/out/payload/$1-manifest.json" \
               /couch-integrations.rsa /out/new

@@ -59,6 +59,7 @@ jobs:
         run: |
           cargo test --locked --manifest-path clients/Cargo.toml -p couch-plugin --test protocol
           python3 tools/integrations/validate_catalog.py --run-tests
+          cargo test --locked --manifest-path clients/Cargo.toml -p couch-denon --test admission concurrent_package_startup_is_offline_and_race_free -- --exact
           cargo test --locked --manifest-path daemon/Cargo.toml -p couch-integrations
       - name: Build native ARM payloads and exercise full APK admission
         working-directory: couch
@@ -101,9 +102,34 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  publisher-smoke:
+    needs: build-artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: feed
+      - name: Check out the exact Couch source pin
+        working-directory: feed
+        run: |
+          commit=$(python3 -c 'import json; print(json.load(open("source-pin.json"))["commit"])')
+          git clone --filter=blob:none https://github.com/dangerouslaser/couch.git ../couch
+          git -C ../couch checkout --detach "$commit"
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+      - uses: actions/download-artifact@v4
+        with:
+          name: preview-armv7-payload
+          path: ${{ runner.temp }}/payload
+      - name: Sign twice with a disposable key and verify immutable feed output
+        working-directory: feed
+        run: scripts/test_publish.sh "$PWD" ../couch "$RUNNER_TEMP/payload"
+
   admission:
     if: always()
-    needs: [policy, core-admission, build-artifact]
+    needs: [policy, core-admission, build-artifact, publisher-smoke]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every feed admission layer
@@ -111,7 +137,9 @@ jobs:
           POLICY: ${{ needs.policy.result }}
           CORE: ${{ needs.core-admission.result }}
           ARTIFACT: ${{ needs.build-artifact.result }}
+          PUBLISHER: ${{ needs.publisher-smoke.result }}
         run: |
           test "$POLICY" = success
           test "$CORE" = success
           test "$ARTIFACT" = success
+          test "$PUBLISHER" = success
