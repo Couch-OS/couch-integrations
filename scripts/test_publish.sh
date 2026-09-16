@@ -85,7 +85,11 @@ docker run --rm --platform linux/arm/v7 \
             install-repository couch-integration-denon --repository http://127.0.0.1:18080
         "$confd" integrations --root /tmp/repository-store list | grep -Fx "denon $version"
         "$confd" integrations --root /tmp/repository-store remove denon
-        test ! -e /tmp/repository-store/state/denon
+        repository_list=$("$confd" integrations --root /tmp/repository-store list)
+        test -z "$repository_list"
+        test ! -e /tmp/repository-store/slots/denon
+        test -f /tmp/repository-store/state/denon
+        test "$(cat /tmp/repository-store/state/denon)" = "{\"active\":null,\"previous\":null}"
     '
 
 # A same-version run restores the published receipt and package rather than
