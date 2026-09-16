@@ -19,14 +19,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
-      - name: Check pinned source and channel policy
+      - name: Check source pins and channel policy
         run: |
           test -f keys/couch-integrations.rsa.pub
-          python3 -c 'import json; print(json.load(open("source-pin.json"))["commit"])' | grep -Ex '[0-9a-f]{40}'
+          python3 scripts/validate_feed.py --pins-only
           python3 -c 'import json; policy=json.load(open("feed-policy.json")); assert policy["channels"]["stable"]["ids"] == []'
           python3 -m unittest discover -s tests -v
 
-  core-admission:
+  source-admission:
     needs: policy
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -34,43 +34,42 @@ jobs:
       - uses: actions/checkout@v6
         with:
           path: feed
-      - name: Check out the exact Couch source pin
+      - name: Check out every exact source pin
         working-directory: feed
-        run: |
-          commit=$(python3 -c 'import json; print(json.load(open("source-pin.json"))["commit"])')
-          git clone --filter=blob:none https://github.com/dangerouslaser/couch.git ../couch
-          git -C ../couch checkout --detach "$commit"
-      - name: Validate feed against its exact source
-        working-directory: feed
-        run: python3 scripts/validate_feed.py --core ../couch
-      - name: Validate the pinned core catalog and required cases
-        working-directory: couch
-        run: |
-          python3 tools/integrations/validate_catalog.py
-          python3 -m unittest tools.integrations.test_validate_catalog -v
+        run: scripts/checkout_sources.sh ../sources
       - uses: dtolnay/rust-toolchain@stable
         with:
+          components: rustfmt
           targets: armv7-unknown-linux-musleabihf
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: arm
-      - name: Run host protocol and every exact catalog test
-        working-directory: couch
+      - name: Validate reusable core protocol and package host
+        working-directory: sources/tooling
         run: |
           cargo test --locked --manifest-path clients/Cargo.toml -p couch-plugin --test protocol
-          python3 tools/integrations/validate_catalog.py --run-tests
-          cargo test --locked --manifest-path clients/Cargo.toml -p couch-denon --test admission concurrent_package_startup_is_offline_and_race_free -- --exact
+          python3 tools/integrations/validate_catalog.py
+          python3 -m unittest tools.integrations.test_validate_catalog -v
           cargo test --locked --manifest-path daemon/Cargo.toml -p couch-integrations
-      - name: Build native ARM payloads and exercise full APK admission
-        working-directory: couch
+      - name: Run each independent integration's locked admission suite
+        working-directory: feed
+        run: |
+          python3 scripts/validate_feed.py --sources ../sources --emit-selected >"$RUNNER_TEMP/selected.tsv"
+          while IFS=$'\t' read -r id cargo_manifest package binary manifest repository commit sdk_commit; do
+            cargo fmt --manifest-path "../sources/integrations/$id/$cargo_manifest" -- --check
+            cargo test --locked --all-targets --manifest-path "../sources/integrations/$id/$cargo_manifest"
+          done <"$RUNNER_TEMP/selected.tsv"
+      - name: Preserve native catalog and package-host admission
+        working-directory: sources/tooling
         run: |
           tools/fetch-zig.sh
           . tools/arm-cc-env.sh
+          jq -r '.integrations[] | [.cargo_package, .binary] | @tsv' integrations/catalog.json >"$RUNNER_TEMP/catalog.tsv"
           while IFS=$'\t' read -r package binary; do
             (cd clients && cargo build --locked --release --target armv7-unknown-linux-musleabihf -p "$package" --bin "$binary")
-          done < <(jq -r '.integrations[] | [.cargo_package, .binary] | @tsv' integrations/catalog.json)
+          done <"$RUNNER_TEMP/catalog.tsv"
           (cd daemon && cargo build --locked --release --target armv7-unknown-linux-musleabihf -p couch-confd)
-          tools/integrations/smoke.sh "$RUNNER_TEMP/integration-smoke"
+          tools/integrations/smoke.sh "$RUNNER_TEMP/native-catalog-smoke"
 
   build-artifact:
     needs: policy
@@ -80,21 +79,18 @@ jobs:
       - uses: actions/checkout@v6
         with:
           path: feed
-      - name: Check out the exact Couch source pin
+      - name: Check out every exact source pin
         working-directory: feed
-        run: |
-          commit=$(python3 -c 'import json; print(json.load(open("source-pin.json"))["commit"])')
-          git clone --filter=blob:none https://github.com/dangerouslaser/couch.git ../couch
-          git -C ../couch checkout --detach "$commit"
+        run: scripts/checkout_sources.sh ../sources
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: armv7-unknown-linux-musleabihf
       - name: Install the pinned ARM C toolchain
-        working-directory: couch
+        working-directory: sources/tooling
         run: tools/fetch-zig.sh
-      - name: Build unsigned, reviewable ARM payload artifact
+      - name: Build unsigned, reviewable ARM payloads
         working-directory: feed
-        run: scripts/build_artifact.sh ../couch "$RUNNER_TEMP/payload"
+        run: scripts/build_artifact.sh ../sources "$RUNNER_TEMP/payload"
       - uses: actions/upload-artifact@v4
         with:
           name: preview-armv7-payload
@@ -105,41 +101,48 @@ jobs:
   publisher-smoke:
     needs: build-artifact
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
           path: feed
-      - name: Check out the exact Couch source pin
+      - name: Check out every exact source pin
         working-directory: feed
-        run: |
-          commit=$(python3 -c 'import json; print(json.load(open("source-pin.json"))["commit"])')
-          git clone --filter=blob:none https://github.com/dangerouslaser/couch.git ../couch
-          git -C ../couch checkout --detach "$commit"
+        run: scripts/checkout_sources.sh ../sources
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: arm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf
       - uses: actions/download-artifact@v4
         with:
           name: preview-armv7-payload
           path: ${{ runner.temp }}/payload
-      - name: Sign twice with a disposable key and verify immutable feed output
+      - name: Build the pinned ARM package host
+        working-directory: sources/tooling
+        run: |
+          tools/fetch-zig.sh
+          . tools/arm-cc-env.sh
+          cd daemon
+          cargo build --locked --release --target armv7-unknown-linux-musleabihf -p couch-confd
+      - name: Sign twice with a disposable key and verify immutable output
         working-directory: feed
-        run: scripts/test_publish.sh "$PWD" ../couch "$RUNNER_TEMP/payload"
+        run: scripts/test_publish.sh "$PWD" ../sources "$RUNNER_TEMP/payload"
 
   admission:
     if: always()
-    needs: [policy, core-admission, build-artifact, publisher-smoke]
+    needs: [policy, source-admission, build-artifact, publisher-smoke]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every feed admission layer
         env:
           POLICY: ${{ needs.policy.result }}
-          CORE: ${{ needs.core-admission.result }}
+          SOURCES: ${{ needs.source-admission.result }}
           ARTIFACT: ${{ needs.build-artifact.result }}
           PUBLISHER: ${{ needs.publisher-smoke.result }}
         run: |
           test "$POLICY" = success
-          test "$CORE" = success
+          test "$SOURCES" = success
           test "$ARTIFACT" = success
           test "$PUBLISHER" = success

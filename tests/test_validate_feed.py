@@ -20,178 +20,214 @@ class FeedPolicyTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.old_root = feed.ROOT
         feed.ROOT = self.root
-        self.core_count = 0
+        self.tooling_commit = "a" * 40
+        self.source_commit = "b" * 40
         (self.root / "keys").mkdir()
-        (self.root / "source-pin.json").write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "repository": "https://github.com/dangerouslaser/couch.git",
-                    "commit": "a" * 40,
-                }
-            )
-        )
+        self.write_pins()
+        self.write_policy([])
 
     def tearDown(self):
         feed.ROOT = self.old_root
         self.temp.cleanup()
 
-    def write_policy(
-        self,
-        stable_ids,
-        *,
-        stable_tiers=None,
-        preview_ids=None,
-        preview_tiers=None,
-    ):
-        (self.root / "feed-policy.json").write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "channels": {
-                        "preview": {
-                            "ids": ["denon"] if preview_ids is None else preview_ids,
-                            "allowed_tiers": ["preview"]
-                            if preview_tiers is None
-                            else preview_tiers,
-                        },
-                        "stable": {
-                            "ids": stable_ids,
-                            "allowed_tiers": ["production"]
-                            if stable_tiers is None
-                            else stable_tiers,
-                        },
-                    },
-                }
-            )
-        )
-
-    def write_core(self, entry, manifest=None):
-        self.core_count += 1
-        core = self.root / f"core-{self.core_count}"
-        (core / "integrations").mkdir(parents=True)
-        (core / "integrations/catalog.json").write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "protocol_version": 1,
-                    "integrations": [entry],
-                }
-            )
-        )
-        manifest_name = entry.get("manifest")
-        if manifest is not None and isinstance(manifest_name, str) and ".." not in manifest_name:
-            manifest_path = core / manifest_name
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            manifest_path.write_text(json.dumps(manifest))
-        return core
-
     @staticmethod
-    def denon_entry(**changes):
-        entry = {
+    def write_json(path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value), encoding="utf-8")
+
+    def write_pins(self, *, include_denon=True, denon_changes=None):
+        integrations = {}
+        if include_denon:
+            pin = {
+                "repository": "https://github.com/dangerouslaser/couch-integration-denon.git",
+                "commit": self.source_commit,
+            }
+            pin.update(denon_changes or {})
+            integrations["denon"] = pin
+        self.write_json(
+            self.root / "source-pin.json",
+            {
+                "schema": 2,
+                "tooling": {
+                    "repository": feed.CORE_REPOSITORY,
+                    "commit": self.tooling_commit,
+                },
+                "integrations": integrations,
+            },
+        )
+
+    def write_policy(self, stable, *, preview=None, preview_tiers=None, stable_tiers=None):
+        self.write_json(
+            self.root / "feed-policy.json",
+            {
+                "schema": 1,
+                "channels": {
+                    "preview": {
+                        "ids": ["denon"] if preview is None else preview,
+                        "allowed_tiers": ["preview"] if preview_tiers is None else preview_tiers,
+                    },
+                    "stable": {
+                        "ids": stable,
+                        "allowed_tiers": ["production"] if stable_tiers is None else stable_tiers,
+                    },
+                },
+            },
+        )
+
+    def write_sources(self, *, metadata_changes=None, cargo=None, manifest_changes=None):
+        sources = self.root / "sources"
+        tooling = sources / "tooling"
+        for required in (
+            "tools/arm-cc-env.sh", "tools/fetch-zig.sh",
+            "tools/integrations/build-apk.sh", "tools/integrations/build-repository.sh",
+        ):
+            path = tooling / required
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n", encoding="utf-8")
+        denon = sources / "integrations/denon"
+        metadata = {
+            "schema": 1,
+            "protocol_version": 1,
             "id": "denon",
             "tier": "preview",
-            "manifest": "clients/couch-denon/plugin.json",
+            "synthetic": False,
+            "cargo_manifest": "Cargo.toml",
+            "cargo_package": "couch-denon",
             "binary": "couch-plugin-denon",
+            "manifest": "plugin.json",
         }
-        entry.update(changes)
-        return entry
-
-    @staticmethod
-    def denon_manifest(**changes):
+        metadata.update(metadata_changes or {})
+        self.write_json(denon / "integration.json", metadata)
+        revision = self.tooling_commit
+        if cargo is None:
+            cargo = f'''[package]
+name = "couch-denon"
+version = "0.1.1"
+[dependencies]
+couch-plugin = {{ git = "{feed.CORE_REPOSITORY}", rev = "{revision}" }}
+couch-sdk = {{ git = "{feed.CORE_REPOSITORY}", rev = "{revision}" }}
+[dev-dependencies]
+couch-plugin = {{ git = "{feed.CORE_REPOSITORY}", rev = "{revision}" }}
+couch-sdk = {{ git = "{feed.CORE_REPOSITORY}", rev = "{revision}" }}
+'''
+        (denon / "Cargo.toml").write_text(cargo, encoding="utf-8")
+        config = denon / ".cargo/config.toml"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            '[target.armv7-unknown-linux-musleabihf]\nlinker = "rust-lld"\n',
+            encoding="utf-8",
+        )
+        admission = denon / "tests/admission.rs"
+        admission.parent.mkdir(parents=True, exist_ok=True)
+        admission.write_text(
+            "\n".join(
+                f"#[test]\nfn {case}() {{ {call} fixture); }}"
+                for case, call in feed.REQUIRED_ADMISSION_CALLS.items()
+            ),
+            encoding="utf-8",
+        )
         manifest = {
             "protocol_version": 1,
             "id": "denon",
-            "version": "0.1.0",
+            "version": "0.1.1",
             "executable": "bin/couch-plugin-denon",
         }
-        manifest.update(changes)
-        return manifest
+        manifest.update(manifest_changes or {})
+        self.write_json(denon / "plugin.json", manifest)
+        return sources
 
-    def validate(self, core, selected_policy=None):
-        pin = feed.source_pin()
-        selected_policy = feed.policy() if selected_policy is None else selected_policy
-        with mock.patch.object(feed, "git_head", return_value=pin["commit"]):
-            feed.validate_catalog(core, pin, selected_policy)
+    def validate(self, sources):
+        pins = feed.source_pins()
+        policy = feed.policy()
+        def head(path):
+            return self.tooling_commit if path.name == "tooling" else self.source_commit
+        with mock.patch.object(feed, "git_head", side_effect=head):
+            return feed.validate_sources(sources, pins, policy)
 
-    def test_policy_can_name_a_future_stable_package(self):
-        self.write_policy(["denon"])
-        self.assertEqual(feed.policy()["channels"]["stable"]["ids"], ["denon"])
+    def test_independent_source_is_selected_with_immutable_provenance(self):
+        selected = self.validate(self.write_sources())
+        self.assertEqual(selected["denon"]["sdk_commit"], self.tooling_commit)
+        self.assertEqual(feed.source_pins()["integrations"]["denon"]["commit"], self.source_commit)
 
-    def test_stable_policy_cannot_make_preview_publishable(self):
-        self.write_policy([], stable_tiers=["production", "preview"])
+    def test_zero_or_short_source_commit_is_rejected(self):
+        for commit in ("0" * 40, "deadbeef"):
+            with self.subTest(commit=commit):
+                self.write_pins(denon_changes={"commit": commit})
+                with self.assertRaisesRegex(feed.InvalidFeed, "full commit SHA"):
+                    feed.source_pins()
+
+    def test_selected_integration_must_have_its_own_pin(self):
+        self.write_pins(include_denon=False)
+        with self.assertRaisesRegex(feed.InvalidFeed, "unpinned integration"):
+            self.validate(self.write_sources())
+
+    def test_local_or_mixed_sdk_contract_is_rejected(self):
+        revision = self.tooling_commit
+        local = f'''[package]
+name = "couch-denon"
+[dependencies]
+couch-plugin = {{ path = "../copied-protocol" }}
+couch-sdk = {{ git = "{feed.CORE_REPOSITORY}", rev = "{revision}" }}
+[dev-dependencies]
+couch-plugin = {{ git = "{feed.CORE_REPOSITORY}", rev = "{revision}" }}
+couch-sdk = {{ git = "{feed.CORE_REPOSITORY}", rev = "{revision}" }}
+'''
+        with self.assertRaisesRegex(feed.InvalidFeed, "must pin the Couch repository"):
+            self.validate(self.write_sources(cargo=local))
+
+        mixed = local.replace('path = "../copied-protocol"', f'git = "{feed.CORE_REPOSITORY}", rev = "{"c" * 40}"')
+        with self.assertRaisesRegex(feed.InvalidFeed, "do not share one revision"):
+            self.validate(self.write_sources(cargo=mixed))
+
+    def test_manifest_identity_and_paths_are_enforced(self):
+        with self.assertRaisesRegex(feed.InvalidFeed, "plugin manifest does not match"):
+            self.validate(self.write_sources(manifest_changes={"id": "other"}))
+        with self.assertRaisesRegex(feed.InvalidFeed, "path is invalid"):
+            self.validate(self.write_sources(metadata_changes={"manifest": "../plugin.json"}))
+
+    def test_arm_build_requires_the_repository_linker_config(self):
+        sources = self.write_sources()
+        (sources / "integrations/denon/.cargo/config.toml").write_text(
+            '[target.armv7-unknown-linux-musleabihf]\nlinker = "cc"\n',
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(feed.InvalidFeed, "must use rust-lld"):
+            self.validate(sources)
+
+    def test_shared_admission_cases_cannot_be_removed(self):
+        sources = self.write_sources()
+        path = sources / "integrations/denon/tests/admission.rs"
+        path.write_text(path.read_text(encoding="utf-8").replace("testing::spike(", "local_spike("), encoding="utf-8")
+        with self.assertRaisesRegex(feed.InvalidFeed, "reuse the shared spike case"):
+            self.validate(sources)
+
+    def test_synthetic_or_test_only_source_is_never_publishable(self):
+        for changes in ({"synthetic": True}, {"tier": "test-only"}):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(feed.InvalidFeed, "never publish"):
+                    self.validate(self.write_sources(metadata_changes=changes))
+
+    def test_stable_remains_production_only(self):
+        self.write_policy([], stable_tiers=["preview", "production"])
         with self.assertRaisesRegex(feed.InvalidFeed, "production tier only"):
             feed.policy()
 
-    def test_malformed_tier_values_fail_closed(self):
-        self.write_policy([], preview_tiers=[{"tier": "preview"}])
-        with self.assertRaisesRegex(feed.InvalidFeed, "invalid IDs or tiers"):
+    def test_integration_cannot_appear_in_both_channels(self):
+        self.write_policy(["denon"])
+        with self.assertRaisesRegex(feed.InvalidFeed, "only one channel"):
             feed.policy()
 
-    def test_stable_rejects_preview_even_if_caller_supplies_relaxed_policy(self):
-        core = self.write_core(self.denon_entry(), self.denon_manifest())
-        selected_policy = {
-            "channels": {
-                "preview": {"ids": [], "allowed_tiers": ["preview"]},
-                "stable": {"ids": ["denon"], "allowed_tiers": ["preview", "production"]},
-            }
-        }
-        with self.assertRaisesRegex(feed.InvalidFeed, "stable selects non-production"):
-            self.validate(core, selected_policy)
-
-    def test_test_only_and_synthetic_catalog_entries_are_never_published(self):
-        self.write_policy([], preview_ids=["denon"], preview_tiers=["preview", "production"])
-        for entry in [
-            self.denon_entry(tier="test-only"),
-            self.denon_entry(synthetic=True),
-        ]:
-            with self.subTest(entry=entry):
-                core = self.write_core(entry, self.denon_manifest())
-                with self.assertRaisesRegex(feed.InvalidFeed, "never publish"):
-                    self.validate(core)
-
-    def test_catalog_manifest_path_and_identity_must_be_safe(self):
-        self.write_policy([])
-        escaping = self.write_core(
-            self.denon_entry(manifest="../outside.json"), self.denon_manifest()
-        )
-        with self.assertRaisesRegex(feed.InvalidFeed, "catalog paths are invalid"):
-            self.validate(escaping)
-
-        mismatched = self.write_core(
-            self.denon_entry(), self.denon_manifest(id="another-integration")
-        )
-        with self.assertRaisesRegex(feed.InvalidFeed, "manifest does not match"):
-            self.validate(mismatched)
+    def test_checked_out_source_must_match_its_pin(self):
+        sources = self.write_sources()
+        pins = feed.source_pins()
+        with mock.patch.object(feed, "git_head", return_value="c" * 40):
+            with self.assertRaisesRegex(feed.InvalidFeed, "tooling source does not match"):
+                feed.validate_sources(sources, pins, feed.policy())
 
     def test_placeholder_key_cannot_enable_feed(self):
-        self.write_policy([])
-        (self.root / "keys/couch-integrations.rsa.pub").write_text(
-            "REPLACE_WITH_THE_PUBLIC_HALF_OF_APK_SIGNING_KEY\n"
-        )
+        (self.root / "keys/couch-integrations.rsa.pub").write_text("REPLACE_WITH_PUBLIC_KEY\n")
         with self.assertRaisesRegex(feed.InvalidFeed, "replace keys"):
             feed.validate_key()
-
-    def test_source_pin_requires_full_commit(self):
-        (self.root / "source-pin.json").write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "repository": "https://github.com/dangerouslaser/couch.git",
-                    "commit": "deadbeef",
-                }
-            )
-        )
-        with self.assertRaisesRegex(feed.InvalidFeed, "full commit SHA"):
-            feed.source_pin()
-
-    def test_checked_out_source_must_match_the_pin(self):
-        core = self.root / "core"
-        core.mkdir()
-        pin = feed.source_pin()
-        with mock.patch.object(feed, "git_head", return_value="b" * 40):
-            with self.assertRaisesRegex(feed.InvalidFeed, "does not match source-pin"):
-                feed.validate_catalog(core, pin, {"channels": {}})
 
 
 if __name__ == "__main__":

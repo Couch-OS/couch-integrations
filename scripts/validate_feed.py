@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the Couch source pin, channel policy, and committed APK trust key."""
+"""Validate immutable integration sources, channel policy, and APK trust."""
 from __future__ import annotations
 
 import argparse
@@ -7,13 +7,26 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMIT = re.compile(r"[0-9a-f]{40}")
-EXPECTED_REPOSITORY = "https://github.com/dangerouslaser/couch.git"
+REPOSITORY = re.compile(r"https://github\.com/dangerouslaser/[a-z0-9][a-z0-9._-]*\.git")
+CORE_REPOSITORY = "https://github.com/dangerouslaser/couch.git"
 CHANNELS = {"preview", "stable"}
 PUBLISHABLE_TIERS = {"preview", "production"}
+METADATA_KEYS = {
+    "schema", "protocol_version", "id", "tier", "synthetic",
+    "cargo_manifest", "cargo_package", "binary", "manifest",
+}
+REQUIRED_ADMISSION_CALLS = {
+    "conformance": "testing::conformance(",
+    "failure": "testing::failure(",
+    "timeout_no_retry": "testing::timeout_no_retry(",
+    "spike": "testing::spike(",
+    "concurrent_package_startup_is_offline_and_race_free": "testing::Package::new(",
+}
 
 
 class InvalidFeed(ValueError):
@@ -24,7 +37,7 @@ def load_json(path: Path) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise InvalidFeed(f"cannot read {path.name}: {error}") from error
+        raise InvalidFeed(f"cannot read {path}: {error}") from error
     if not isinstance(value, dict):
         raise InvalidFeed(f"{path.name} must be an object")
     return value
@@ -40,11 +53,7 @@ def safe_component(value: object) -> bool:
         isinstance(value, str)
         and bool(value)
         and not value.startswith(".")
-        and all(
-            byte.isascii()
-            and (byte.isalnum() or byte in {".", "+", "_", "-"})
-            for byte in value
-        )
+        and all(byte.isascii() and (byte.isalnum() or byte in {".", "+", "_", "-"}) for byte in value)
     )
 
 
@@ -55,17 +64,35 @@ def safe_relative_path(value: object) -> bool:
     return not path.is_absolute() and all(safe_component(part) for part in path.parts)
 
 
-def source_pin() -> dict:
-    pin = load_json(ROOT / "source-pin.json")
-    exact_keys(pin, {"schema", "repository", "commit"}, "source-pin.json")
+def validate_pin(pin: object, context: str, *, core: bool = False) -> dict:
+    if not isinstance(pin, dict):
+        raise InvalidFeed(f"{context} must be an object")
+    exact_keys(pin, {"repository", "commit"}, context)
+    repository = pin["repository"]
+    commit = pin["commit"]
     if (
-        pin["schema"] != 1
-        or pin["repository"] != EXPECTED_REPOSITORY
-        or not isinstance(pin["commit"], str)
-        or not COMMIT.fullmatch(pin["commit"])
+        not isinstance(repository, str)
+        or not REPOSITORY.fullmatch(repository)
+        or (core and repository != CORE_REPOSITORY)
+        or not isinstance(commit, str)
+        or not COMMIT.fullmatch(commit)
+        or commit == "0" * 40
     ):
-        raise InvalidFeed("source-pin.json must name dangerouslaser/couch at one full commit SHA")
+        raise InvalidFeed(f"{context} must name an allowed repository at one full commit SHA")
     return pin
+
+
+def source_pins() -> dict:
+    pins = load_json(ROOT / "source-pin.json")
+    exact_keys(pins, {"schema", "tooling", "integrations"}, "source-pin.json")
+    if pins["schema"] != 2 or not isinstance(pins["integrations"], dict):
+        raise InvalidFeed("source-pin.json must use multi-source schema 2")
+    validate_pin(pins["tooling"], "tooling source", core=True)
+    for integration_id, pin in pins["integrations"].items():
+        if not safe_component(integration_id):
+            raise InvalidFeed("source-pin.json has an invalid integration ID")
+        validate_pin(pin, f"{integration_id} source")
+    return pins
 
 
 def policy() -> dict:
@@ -74,6 +101,7 @@ def policy() -> dict:
     channels = value["channels"]
     if value["schema"] != 1 or not isinstance(channels, dict) or set(channels) != CHANNELS:
         raise InvalidFeed("feed-policy.json must define preview and stable channels")
+    selected: list[str] = []
     for channel, rule in channels.items():
         if not isinstance(rule, dict):
             raise InvalidFeed(f"{channel} policy must be an object")
@@ -83,14 +111,14 @@ def policy() -> dict:
             or not all(safe_component(item) for item in rule["ids"])
             or len(set(rule["ids"])) != len(rule["ids"])
             or not isinstance(rule["allowed_tiers"], list)
-            or not all(
-                isinstance(item, str) and item in PUBLISHABLE_TIERS
-                for item in rule["allowed_tiers"]
-            )
+            or not all(isinstance(item, str) and item in PUBLISHABLE_TIERS for item in rule["allowed_tiers"])
             or not rule["allowed_tiers"]
             or len(set(rule["allowed_tiers"])) != len(rule["allowed_tiers"])
         ):
             raise InvalidFeed(f"{channel} policy has invalid IDs or tiers")
+        selected.extend(rule["ids"])
+    if len(set(selected)) != len(selected):
+        raise InvalidFeed("an integration may appear in only one channel")
     if value["channels"]["stable"]["allowed_tiers"] != ["production"]:
         raise InvalidFeed("stable policy must allow production tier only")
     return value
@@ -108,94 +136,163 @@ def validate_key() -> None:
         raise InvalidFeed("committed APK public key must be a PEM public key")
     checked = subprocess.run(
         ["openssl", "pkey", "-pubin", "-in", str(path), "-noout"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if checked.returncode:
         raise InvalidFeed(f"committed APK public key is invalid: {checked.stderr.strip()}")
 
 
-def git_head(core: Path) -> str:
+def git_head(source: Path) -> str:
     checked = subprocess.run(
-        ["git", "-C", str(core), "rev-parse", "HEAD"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if checked.returncode:
-        raise InvalidFeed(f"cannot read checked out Couch source: {checked.stderr.strip()}")
+        raise InvalidFeed(f"cannot read checked out source {source}: {checked.stderr.strip()}")
     return checked.stdout.strip()
 
 
-def validate_catalog(core: Path, pin: dict, selected_policy: dict) -> None:
-    if git_head(core) != pin["commit"]:
-        raise InvalidFeed("checked out Couch source does not match source-pin.json")
-    catalog_path = core / "integrations/catalog.json"
-    catalog = load_json(catalog_path)
-    if catalog.get("schema") != 1 or catalog.get("protocol_version") != 1:
-        raise InvalidFeed("pinned Couch catalog must use integration protocol 1")
-    entries = catalog.get("integrations")
-    if not isinstance(entries, list):
-        raise InvalidFeed("pinned Couch catalog has no integration list")
-    by_id = {}
-    for entry in entries:
-        if not isinstance(entry, dict) or not safe_component(entry.get("id")):
-            raise InvalidFeed("pinned Couch catalog has an invalid integration ID")
-        integration_id = entry["id"]
-        if integration_id in by_id:
-            raise InvalidFeed(f"pinned Couch catalog repeats integration {integration_id}")
-        by_id[integration_id] = entry
+def contained_file(source: Path, relative: object, context: str) -> Path:
+    if not safe_relative_path(relative):
+        raise InvalidFeed(f"{context} path is invalid")
+    resolved = (source / str(relative)).resolve()
+    if not resolved.is_relative_to(source.resolve()) or not resolved.is_file():
+        raise InvalidFeed(f"{context} path is missing or escapes its source")
+    return resolved
+
+
+def dependency_revision(dependency: object, context: str) -> str:
+    if not isinstance(dependency, dict):
+        raise InvalidFeed(f"{context} must be a pinned Git dependency")
+    if dependency.get("git") != CORE_REPOSITORY or not COMMIT.fullmatch(str(dependency.get("rev", ""))):
+        raise InvalidFeed(f"{context} must pin the Couch repository at a full commit")
+    if "path" in dependency or "branch" in dependency or "tag" in dependency:
+        raise InvalidFeed(f"{context} cannot use a local path, branch, or tag")
+    return dependency["rev"]
+
+
+def validate_integration(source: Path, integration_id: str, pin: dict) -> dict:
+    if git_head(source) != pin["commit"]:
+        raise InvalidFeed(f"checked out {integration_id} source does not match its pin")
+    metadata = load_json(source / "integration.json")
+    exact_keys(metadata, METADATA_KEYS, f"{integration_id} integration.json")
+    if (
+        metadata["schema"] != 1
+        or metadata["protocol_version"] != 1
+        or metadata["id"] != integration_id
+        or not isinstance(metadata["tier"], str)
+        or not isinstance(metadata["synthetic"], bool)
+        or not safe_component(metadata["cargo_package"])
+        or not safe_component(metadata["binary"])
+    ):
+        raise InvalidFeed(f"{integration_id} source metadata is invalid")
+    cargo_path = contained_file(source, metadata["cargo_manifest"], f"{integration_id} Cargo manifest")
+    cargo_config_path = (source / ".cargo/config.toml").resolve()
+    if not cargo_config_path.is_relative_to(source.resolve()) or not cargo_config_path.is_file():
+        raise InvalidFeed(f"{integration_id} Cargo config is missing or escapes its source")
+    manifest_path = contained_file(source, metadata["manifest"], f"{integration_id} plugin manifest")
+    admission_path = contained_file(source, "tests/admission.rs", f"{integration_id} admission tests")
+    try:
+        cargo = tomllib.loads(cargo_path.read_text(encoding="utf-8"))
+        cargo_config = tomllib.loads(cargo_config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise InvalidFeed(f"{integration_id} Cargo configuration is unreadable: {error}") from error
+    if cargo.get("package", {}).get("name") != metadata["cargo_package"]:
+        raise InvalidFeed(f"{integration_id} Cargo package does not match integration.json")
+    if cargo_config.get("target", {}).get("armv7-unknown-linux-musleabihf", {}).get("linker") != "rust-lld":
+        raise InvalidFeed(f"{integration_id} must use rust-lld for the ARMv7 target")
+    admission = admission_path.read_text(encoding="utf-8")
+    for case, harness_call in REQUIRED_ADMISSION_CALLS.items():
+        declaration = re.compile(rf"#\[test\]\s*fn\s+{re.escape(case)}\s*\(")
+        if not declaration.search(admission) or harness_call not in admission:
+            raise InvalidFeed(f"{integration_id} admission must reuse the shared {case} case")
+    revisions = {
+        dependency_revision(cargo.get("dependencies", {}).get(name), f"{integration_id} {name}")
+        for name in ("couch-plugin", "couch-sdk")
+    }
+    revisions.update(
+        dependency_revision(cargo.get("dev-dependencies", {}).get(name), f"{integration_id} dev {name}")
+        for name in ("couch-plugin", "couch-sdk")
+    )
+    if len(revisions) != 1:
+        raise InvalidFeed(f"{integration_id} SDK dependencies do not share one revision")
+    metadata = dict(metadata)
+    metadata["sdk_commit"] = revisions.pop()
+    manifest = load_json(manifest_path)
+    if (
+        manifest.get("protocol_version") != 1
+        or manifest.get("id") != integration_id
+        or not isinstance(manifest.get("version"), str)
+        or not manifest["version"]
+        or manifest.get("executable") != f"bin/{metadata['binary']}"
+    ):
+        raise InvalidFeed(f"{integration_id} plugin manifest does not match integration.json")
+    metadata["source"] = source
+    metadata["manifest_data"] = manifest
+    return metadata
+
+
+def validate_sources(sources: Path, pins: dict, selected_policy: dict) -> dict[str, dict]:
+    tooling = sources / "tooling"
+    if git_head(tooling) != pins["tooling"]["commit"]:
+        raise InvalidFeed("checked out tooling source does not match its pin")
+    for required in (
+        "tools/arm-cc-env.sh", "tools/fetch-zig.sh",
+        "tools/integrations/build-apk.sh", "tools/integrations/build-repository.sh",
+    ):
+        contained_file(tooling, required, "tooling")
+    selected: dict[str, dict] = {}
     for channel, rule in selected_policy["channels"].items():
         for integration_id in rule["ids"]:
-            entry = by_id.get(integration_id)
-            if entry is None:
-                raise InvalidFeed(f"{channel} selects missing integration {integration_id}")
-            tier = entry.get("tier")
-            synthetic = entry.get("synthetic", False)
-            if not isinstance(tier, str) or not isinstance(synthetic, bool):
-                raise InvalidFeed(f"{integration_id} catalog tier or synthetic flag is invalid")
+            pin = pins["integrations"].get(integration_id)
+            if pin is None:
+                raise InvalidFeed(f"{channel} selects unpinned integration {integration_id}")
+            metadata = validate_integration(sources / "integrations" / integration_id, integration_id, pin)
+            tier = metadata["tier"]
             if channel == "stable" and tier != "production":
                 raise InvalidFeed(f"stable selects non-production integration {integration_id}")
-            if tier == "test-only" or synthetic:
+            if tier == "test-only" or metadata["synthetic"]:
                 raise InvalidFeed(f"{channel} must never publish synthetic or test-only {integration_id}")
             if tier not in rule["allowed_tiers"]:
                 raise InvalidFeed(f"{channel} selects {integration_id} at disallowed tier {tier!r}")
-            manifest_name = entry.get("manifest")
-            binary = entry.get("binary")
-            if not safe_relative_path(manifest_name) or not safe_component(binary):
-                raise InvalidFeed(f"{integration_id} catalog paths are invalid")
-            manifest = (core / manifest_name).resolve()
-            if not manifest.is_relative_to(core.resolve()):
-                raise InvalidFeed(f"{integration_id} manifest escapes the pinned Couch source")
-            try:
-                manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                raise InvalidFeed(f"{integration_id} manifest is unreadable: {error}") from error
-            if (
-                not isinstance(manifest_data, dict)
-                or manifest_data.get("protocol_version") != 1
-                or manifest_data.get("id") != integration_id
-                or not isinstance(manifest_data.get("version"), str)
-                or not manifest_data["version"]
-                or manifest_data.get("executable") != f"bin/{binary}"
-            ):
-                raise InvalidFeed(f"{integration_id} manifest does not match its catalog record")
+            selected[integration_id] = metadata
+    return selected
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--core", type=Path, required=True, help="checkout of the pinned Couch source")
+    parser.add_argument("--sources", type=Path, help="checkout tree created by checkout_sources.sh")
+    parser.add_argument("--pins-only", action="store_true", help="validate committed pins without checkouts")
+    parser.add_argument("--emit-pins", action="store_true", help="emit validated checkout pins as TSV")
+    parser.add_argument("--emit-selected", action="store_true", help="emit selected integration metadata as TSV")
     args = parser.parse_args()
     try:
-        pin = source_pin()
+        pins = source_pins()
         selected_policy = policy()
         validate_key()
-        validate_catalog(args.core.resolve(), pin, selected_policy)
+        if args.emit_pins:
+            print("\t".join(("tooling", pins["tooling"]["repository"], pins["tooling"]["commit"])))
+            for integration_id, pin in sorted(pins["integrations"].items()):
+                print("\t".join((f"integrations/{integration_id}", pin["repository"], pin["commit"])))
+            return 0
+        if args.pins_only:
+            return 0
+        if args.sources is None:
+            raise InvalidFeed("--sources is required unless --pins-only is used")
+        selected = validate_sources(args.sources.resolve(), pins, selected_policy)
+        if args.emit_selected:
+            for integration_id in selected_policy["channels"]["preview"]["ids"]:
+                item = selected[integration_id]
+                print("\t".join((
+                    integration_id, item["cargo_manifest"], item["cargo_package"], item["binary"],
+                    item["manifest"], pins["integrations"][integration_id]["repository"],
+                    pins["integrations"][integration_id]["commit"], item["sdk_commit"],
+                )))
+            return 0
     except InvalidFeed as error:
         print(f"feed validation failed: {error}", file=sys.stderr)
         return 1
-    print(f"feed policy valid for Couch {pin['commit']}")
+    print(f"feed policy valid for {len(selected)} independently pinned integration source(s)")
     return 0
 
 

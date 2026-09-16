@@ -51,14 +51,11 @@ jobs:
           path: ${{ runner.temp }}/payload
           run-id: ${{ inputs.admission_run_id }}
           github-token: ${{ github.token }}
-      - name: Check out the exact approved Couch source pin
+      - name: Check out every exact approved source pin
         working-directory: feed
         run: |
-          commit=$(python3 -c 'import json; print(json.load(open("source-pin.json"))["commit"])')
-          git clone --filter=blob:none https://github.com/dangerouslaser/couch.git ../couch
-          git -C ../couch checkout --detach "$commit"
-          python3 scripts/validate_feed.py --core ../couch
-          python3 scripts/validate_payload.py . ../couch "$RUNNER_TEMP/payload"
+          scripts/checkout_sources.sh ../sources
+          python3 scripts/validate_payload.py . ../sources "$RUNNER_TEMP/payload"
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: arm
@@ -89,7 +86,7 @@ jobs:
       - name: Build signed indexes from the reviewed payload artifact
         working-directory: feed
         run: |
-          scripts/publish.sh ../couch "$RUNNER_TEMP/couch-integrations.rsa" \
+          scripts/publish.sh ../sources "$RUNNER_TEMP/couch-integrations.rsa" \
             "$RUNNER_TEMP/previous-site" "$RUNNER_TEMP/payload" "$RUNNER_TEMP/site"
       - name: Archive immutable release assets
         working-directory: feed
@@ -105,7 +102,7 @@ jobs:
               "$RUNNER_TEMP/site/preview/armv7/APKINDEX.tar.gz" \
               "$RUNNER_TEMP/site/preview/armv7/"*.apk \
               --target "$GITHUB_SHA" --title "Couch integration feed ${GITHUB_SHA:0:12}" \
-              --notes "Signed ARMv7 preview feed built from the pinned Couch commit."
+              --notes "Signed ARMv7 preview feed built from independently pinned integration sources."
           fi
       - name: Remove the ephemeral private key
         if: always()

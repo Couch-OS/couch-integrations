@@ -3,9 +3,9 @@
 # never reads APK_SIGNING_KEY or modifies the real feed checkout.
 set -eu
 
-[ "$#" = 3 ] || { echo "Usage: $0 FEED_ROOT CORE_CHECKOUT PAYLOAD_DIR" >&2; exit 64; }
+[ "$#" = 3 ] || { echo "Usage: $0 FEED_ROOT SOURCES_DIR PAYLOAD_DIR" >&2; exit 64; }
 feed=$(CDPATH= cd -- "$1" && pwd -P)
-core=$(CDPATH= cd -- "$2" && pwd -P)
+sources=$(CDPATH= cd -- "$2" && pwd -P)
 payload=$(CDPATH= cd -- "$3" && pwd -P)
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 1; }
 command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 1; }
@@ -23,35 +23,84 @@ openssl genrsa -out "$key" 4096 >/dev/null 2>&1
 openssl pkey -in "$key" -pubout >"$test_feed/keys/couch-integrations.rsa.pub"
 
 mkdir "$work/empty-history"
-"$test_feed/scripts/publish.sh" "$core" "$key" "$work/empty-history" "$payload" "$work/first"
+"$test_feed/scripts/publish.sh" "$sources" "$key" "$work/empty-history" "$payload" "$work/first"
 
 package=$(find "$work/first/preview/armv7" -maxdepth 1 -type f -name 'couch-integration-denon-*.apk' -print -quit)
 [ -n "$package" ] || { echo "first publish emitted no Denon APK" >&2; exit 1; }
-first_digest=$(sha256sum "$package" | awk '{print $1}')
+first_digest=$(sha256sum "$package")
+first_digest=${first_digest%% *}
 
 # The signing key is made available under its real public basename exactly as
 # a Couch installer uses it. Both indexes and the package must verify.
 docker run --rm --platform linux/arm/v7 \
     -v "$work/first:/site:ro" \
+    -v "$sources/tooling:/src:ro" \
     -v "$test_feed/keys/couch-integrations.rsa.pub:/keys/couch-integrations.rsa.pub:ro" \
     alpine:3.21 sh -ec '
+        apk add --no-cache busybox-extras >/dev/null
         apk --arch armv7 --keys-dir /keys --repositories-file /dev/null --repository /site/preview --no-cache update
         apk --keys-dir /keys verify /site/preview/armv7/*.apk
         apk --arch armv7 --keys-dir /keys --repositories-file /dev/null --repository /site/stable --no-cache update
-        test "$(tar -xOzf /site/stable/armv7/APKINDEX.tar.gz APKINDEX | wc -c)" -eq 0
+        tar -xOzf /site/stable/armv7/APKINDEX.tar.gz APKINDEX >/tmp/stable-index
+        test ! -s /tmp/stable-index
+
+        # Exercise the externally built package through the real pinned Couch
+        # host, not only Alpine signature verification.
+        confd=/src/daemon/target/armv7-unknown-linux-musleabihf/release/couch-confd
+        test -x "$confd"
+        package=$(find /site/preview/armv7 -maxdepth 1 -type f -name "couch-integration-denon-*.apk" -print -quit)
+        test -n "$package"
+        version=${package##*/couch-integration-denon-}
+        version=${version%-r0.apk}
+        store=/tmp/denon-home/integrations
+        "$confd" integrations --root "$store" --keys-dir /keys install-sideload "$package"
+        "$confd" integrations --root "$store" list | grep -Fx "denon $version"
+        mkdir -p /tmp/denon-home/connections/denon-test
+        printf "%s\n" "{\"connections\":[{\"id\":\"denon-test\",\"provider\":{\"kind\":\"plugin\",\"id\":\"denon\"}}]}" \
+            >/tmp/denon-home/config.json
+        printf "%s\n" "{\"host\":\"127.0.0.1\",\"port\":23}" \
+            >/tmp/denon-home/connections/denon-test/plugin-connection.json
+        before=$(sha256sum "$store/state/denon")
+        "$confd" integrations --root "$store" --keys-dir /keys install-sideload "$package"
+        after=$(sha256sum "$store/state/denon")
+        test "$before" = "$after"
+
+        mkdir /tmp/untrusted-keys
+        if "$confd" integrations --root /tmp/untrusted-store --keys-dir /tmp/untrusted-keys install-sideload "$package"; then
+            echo "unexpected successful untrusted external package install" >&2
+            exit 1
+        fi
+        test ! -e /tmp/untrusted-store/state/denon
+
+        cp "$package" /tmp/tampered.apk
+        printf x >>/tmp/tampered.apk
+        if "$confd" integrations --root /tmp/tampered-store --keys-dir /keys install-sideload /tmp/tampered.apk; then
+            echo "unexpected successful tampered external package install" >&2
+            exit 1
+        fi
+        test ! -e /tmp/tampered-store/state/denon
+
+        busybox-extras httpd -p 18080 -h /site/preview
+        "$confd" integrations --root /tmp/repository-store --keys-dir /keys \
+            install-repository couch-integration-denon --repository http://127.0.0.1:18080
+        "$confd" integrations --root /tmp/repository-store list | grep -Fx "denon $version"
+        "$confd" integrations --root /tmp/repository-store remove denon
+        test ! -e /tmp/repository-store/state/denon
     '
 
 # A same-version run restores the published receipt and package rather than
 # creating a timestamp-dependent replacement artifact.
-"$test_feed/scripts/publish.sh" "$core" "$key" "$work/first" "$payload" "$work/second"
+"$test_feed/scripts/publish.sh" "$sources" "$key" "$work/first" "$payload" "$work/second"
 second_package="$work/second/preview/armv7/$(basename "$package")"
-test "$(sha256sum "$second_package" | awk '{print $1}')" = "$first_digest"
+second_digest=$(sha256sum "$second_package")
+second_digest=${second_digest%% *}
+test "$second_digest" = "$first_digest"
 cmp -s "$package" "$second_package"
 
 # A source pin may advance while an older Denon version remains in the feed.
 # That historical receipt is valid only when every immutable payload identity
 # field matches; publishing must retain its original source commit verbatim.
-prior_commit=$(git -C "$core" rev-parse HEAD^)
+prior_commit=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 older_history="$work/older-receipt-history"
 cp -a "$work/first" "$older_history"
 old_receipt="$older_history/preview/armv7/$(basename "${package%.apk}").provenance.json"
@@ -60,13 +109,15 @@ import json, sys
 from pathlib import Path
 path = Path(sys.argv[1])
 record = json.loads(path.read_text(encoding="utf-8"))
-record["core_commit"] = sys.argv[2]
+record["source_commit"] = sys.argv[2]
 path.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
-"$test_feed/scripts/publish.sh" "$core" "$key" "$older_history" "$payload" "$work/third"
+"$test_feed/scripts/publish.sh" "$sources" "$key" "$older_history" "$payload" "$work/third"
 third_package="$work/third/preview/armv7/$(basename "$package")"
 third_receipt="$work/third/preview/armv7/$(basename "${package%.apk}").provenance.json"
-test "$(sha256sum "$third_package" | awk '{print $1}')" = "$first_digest"
+third_digest=$(sha256sum "$third_package")
+third_digest=${third_digest%% *}
+test "$third_digest" = "$first_digest"
 cmp -s "$package" "$third_package"
 cmp -s "$old_receipt" "$third_receipt"
 
@@ -87,7 +138,7 @@ record = json.loads(path.read_text(encoding="utf-8"))
 record["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
 path.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
-if "$test_feed/scripts/publish.sh" "$core" "$key" "$work/third" "$work/changed-payload" "$work/rejected"; then
+if "$test_feed/scripts/publish.sh" "$sources" "$key" "$work/third" "$work/changed-payload" "$work/rejected"; then
     echo "publisher accepted changed payload at an existing version" >&2
     exit 1
 fi
