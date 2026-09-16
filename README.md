@@ -140,4 +140,5 @@ Require `admission` from GitHub Actions (app ID `15368`) in branch protection,
 with up-to-date branches and administrators included. Signing and Pages
 environments permit `main` only. Repeating publication with the same admitted
 artifact reuses existing APK bytes and regenerates signed indexes. A changed
-payload or provenance at an existing version requires a version bump.
+payload or immutable provenance field at an existing version requires a version
+bump; a retained historical source commit does not replace its older receipt.

@@ -48,6 +48,28 @@ second_package="$work/second/preview/armv7/$(basename "$package")"
 test "$(sha256sum "$second_package" | awk '{print $1}')" = "$first_digest"
 cmp -s "$package" "$second_package"
 
+# A source pin may advance while an older Denon version remains in the feed.
+# That historical receipt is valid only when every immutable payload identity
+# field matches; publishing must retain its original source commit verbatim.
+prior_commit=$(git -C "$core" rev-parse HEAD^)
+older_history="$work/older-receipt-history"
+cp -a "$work/first" "$older_history"
+old_receipt="$older_history/preview/armv7/$(basename "${package%.apk}").provenance.json"
+python3 - "$old_receipt" "$prior_commit" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+record = json.loads(path.read_text(encoding="utf-8"))
+record["core_commit"] = sys.argv[2]
+path.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+PY
+"$test_feed/scripts/publish.sh" "$core" "$key" "$older_history" "$payload" "$work/third"
+third_package="$work/third/preview/armv7/$(basename "$package")"
+third_receipt="$work/third/preview/armv7/$(basename "${package%.apk}").provenance.json"
+test "$(sha256sum "$third_package" | awk '{print $1}')" = "$first_digest"
+cmp -s "$package" "$third_package"
+cmp -s "$old_receipt" "$third_receipt"
+
 # Model a payload whose binary and receipt were both modified after admission.
 # Its self-consistent updated digest reaches the immutable-package guard, which
 # must reject this same version instead of overwriting the published artifact.
@@ -65,7 +87,7 @@ record = json.loads(path.read_text(encoding="utf-8"))
 record["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
 path.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
-if "$test_feed/scripts/publish.sh" "$core" "$key" "$work/first" "$work/changed-payload" "$work/rejected"; then
+if "$test_feed/scripts/publish.sh" "$core" "$key" "$work/third" "$work/changed-payload" "$work/rejected"; then
     echo "publisher accepted changed payload at an existing version" >&2
     exit 1
 fi
