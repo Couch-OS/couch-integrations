@@ -1,0 +1,127 @@
+name: Publish signed feed
+
+on:
+  workflow_dispatch:
+    inputs:
+      admission_run_id:
+        description: Successful main-branch Feed admission run that built the payload
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  actions: read
+
+concurrency:
+  group: signed-feed-publish
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    # workflow_dispatch permits branch selection. Never expose the protected
+    # signing environment to an alternate ref, including a pull request ref.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: package-signing
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: feed
+      - name: Require a successful admission run for this exact main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.admission_run_id }}
+        run: |
+          case "$RUN_ID" in *[!0-9]*|'') exit 1;; esac
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/admission-run.json"
+          test "$(jq -r .conclusion "$RUNNER_TEMP/admission-run.json")" = success
+          test "$(jq -r .head_sha "$RUNNER_TEMP/admission-run.json")" = "$GITHUB_SHA"
+          test "$(jq -r .head_branch "$RUNNER_TEMP/admission-run.json")" = main
+          test "$(jq -r .path "$RUNNER_TEMP/admission-run.json")" = .github/workflows/admission.yml
+          case "$(jq -r .event "$RUNNER_TEMP/admission-run.json")" in push|workflow_dispatch) ;; *) exit 1;; esac
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
+            --jq '.jobs[] | select(.name == "admission") | .conclusion' > "$RUNNER_TEMP/admission-job"
+          grep -Fx success "$RUNNER_TEMP/admission-job"
+      - uses: actions/download-artifact@v4
+        with:
+          name: preview-armv7-payload
+          path: ${{ runner.temp }}/payload
+          run-id: ${{ inputs.admission_run_id }}
+          github-token: ${{ github.token }}
+      - name: Check out the exact approved Couch source pin
+        working-directory: feed
+        run: |
+          commit=$(python3 -c 'import json; print(json.load(open("source-pin.json"))["commit"])')
+          git clone --filter=blob:none https://github.com/dangerouslaser/couch.git ../couch
+          git -C ../couch checkout --detach "$commit"
+          python3 scripts/validate_feed.py --core ../couch
+          python3 scripts/validate_payload.py . ../couch "$RUNNER_TEMP/payload"
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+      - name: Materialize the protected signing key
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          test -n "$APK_SIGNING_KEY"
+          umask 077
+          printf '%s' "$APK_SIGNING_KEY" > "$RUNNER_TEMP/couch-integrations.rsa"
+      - name: Restore immutable package receipts from release archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/previous-site" "$RUNNER_TEMP/release-assets"
+          # Each release archive contains the complete retained feed. Restore
+          # the newest one; download errors must not silently discard history.
+          tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isDraft,publishedAt \
+            --jq 'map(select(.isDraft == false and (.tagName | startswith("integration-")))) | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
+          if [ -n "$tag" ]; then
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+              --pattern couch-integrations-preview-armv7.tar.gz \
+              --dir "$RUNNER_TEMP/release-assets"
+            tar -C "$RUNNER_TEMP/previous-site" -xzf \
+              "$RUNNER_TEMP/release-assets/couch-integrations-preview-armv7.tar.gz"
+          fi
+      - name: Build signed indexes from the reviewed payload artifact
+        working-directory: feed
+        run: |
+          scripts/publish.sh ../couch "$RUNNER_TEMP/couch-integrations.rsa" \
+            "$RUNNER_TEMP/previous-site" "$RUNNER_TEMP/payload" "$RUNNER_TEMP/site"
+      - name: Archive immutable release assets
+        working-directory: feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python3 -c 'import json; print(json.load(open("../couch/clients/couch-denon/plugin.json"))["version"])')
+          tag="integration-denon-v$version"
+          tar -C "$RUNNER_TEMP/site" -czf "$RUNNER_TEMP/couch-integrations-preview-armv7.tar.gz" preview
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP/couch-integrations-preview-armv7.tar.gz" \
+              "$RUNNER_TEMP/site/preview/armv7/APKINDEX.tar.gz" \
+              "$RUNNER_TEMP/site/preview/armv7/couch-integration-denon-$version-r0.apk" \
+              --target "$GITHUB_SHA" --title "Couch integration feed: Denon $version" \
+              --notes "Signed ARMv7 preview feed built from the pinned Couch commit."
+          fi
+      - name: Remove the ephemeral private key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/couch-integrations.rsa"
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    needs: sign
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

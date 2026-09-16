@@ -1,0 +1,117 @@
+name: Feed admission
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: feed-admission-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check pinned source and channel policy
+        run: |
+          test -f keys/couch-integrations.rsa.pub
+          python3 -c 'import json; print(json.load(open("source-pin.json"))["commit"])' | grep -Ex '[0-9a-f]{40}'
+          python3 -c 'import json; policy=json.load(open("feed-policy.json")); assert policy["channels"]["stable"]["ids"] == []'
+          python3 -m unittest discover -s tests -v
+
+  core-admission:
+    needs: policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: feed
+      - name: Check out the exact Couch source pin
+        working-directory: feed
+        run: |
+          commit=$(python3 -c 'import json; print(json.load(open("source-pin.json"))["commit"])')
+          git clone --filter=blob:none https://github.com/dangerouslaser/couch.git ../couch
+          git -C ../couch checkout --detach "$commit"
+      - name: Validate feed against its exact source
+        working-directory: feed
+        run: python3 scripts/validate_feed.py --core ../couch
+      - name: Validate the pinned core catalog and required cases
+        working-directory: couch
+        run: |
+          python3 tools/integrations/validate_catalog.py
+          python3 -m unittest tools.integrations.test_validate_catalog -v
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+      - name: Run host protocol and every exact catalog test
+        working-directory: couch
+        run: |
+          cargo test --locked --manifest-path clients/Cargo.toml -p couch-plugin --test protocol
+          python3 tools/integrations/validate_catalog.py --run-tests
+          cargo test --locked --manifest-path daemon/Cargo.toml -p couch-integrations
+      - name: Build native ARM payloads and exercise full APK admission
+        working-directory: couch
+        run: |
+          tools/fetch-zig.sh
+          . tools/arm-cc-env.sh
+          while IFS=$'\t' read -r package binary; do
+            (cd clients && cargo build --locked --release --target armv7-unknown-linux-musleabihf -p "$package" --bin "$binary")
+          done < <(jq -r '.integrations[] | [.cargo_package, .binary] | @tsv' integrations/catalog.json)
+          (cd daemon && cargo build --locked --release --target armv7-unknown-linux-musleabihf -p couch-confd)
+          tools/integrations/smoke.sh "$RUNNER_TEMP/integration-smoke"
+
+  build-artifact:
+    needs: policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: feed
+      - name: Check out the exact Couch source pin
+        working-directory: feed
+        run: |
+          commit=$(python3 -c 'import json; print(json.load(open("source-pin.json"))["commit"])')
+          git clone --filter=blob:none https://github.com/dangerouslaser/couch.git ../couch
+          git -C ../couch checkout --detach "$commit"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf
+      - name: Install the pinned ARM C toolchain
+        working-directory: couch
+        run: tools/fetch-zig.sh
+      - name: Build unsigned, reviewable ARM payload artifact
+        working-directory: feed
+        run: scripts/build_artifact.sh ../couch "$RUNNER_TEMP/payload"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-armv7-payload
+          path: ${{ runner.temp }}/payload
+          if-no-files-found: error
+          retention-days: 14
+
+  admission:
+    if: always()
+    needs: [policy, core-admission, build-artifact]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every feed admission layer
+        env:
+          POLICY: ${{ needs.policy.result }}
+          CORE: ${{ needs.core-admission.result }}
+          ARTIFACT: ${{ needs.build-artifact.result }}
+        run: |
+          test "$POLICY" = success
+          test "$CORE" = success
+          test "$ARTIFACT" = success

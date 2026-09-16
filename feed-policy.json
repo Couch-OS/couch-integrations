@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "channels": {
+    "preview": {
+      "ids": ["denon"],
+      "allowed_tiers": ["preview"]
+    },
+    "stable": {
+      "ids": [],
+      "allowed_tiers": ["production"]
+    }
+  }
+}
