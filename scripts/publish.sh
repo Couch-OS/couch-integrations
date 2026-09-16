@@ -26,7 +26,10 @@ cmp -s "$derived" "$committed" || {
     exit 1
 }
 
-mkdir -p "$out" "$out/packages" "$out/provenance" "$out/new"
+# Keep host-side output directories owned by the runner. Container-created
+# parent directories would prevent the unprivileged runner moving/cleaning them.
+mkdir -p "$out" "$out/packages" "$out/provenance" "$out/new" \
+    "$out/repository/armv7" "$out/stable-build/armv7"
 cp -a "$root/feed/." "$out/"
 if [ -d "$previous/preview/armv7" ]; then
     find "$previous/preview/armv7" -maxdepth 1 -type f -name 'couch-integration-*.apk' -exec cp {} "$out/packages/" \;
