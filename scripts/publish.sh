@@ -3,16 +3,17 @@
 # protected job never recompiles an integration binary.
 set -eu
 
-[ "$#" = 5 ] || { echo "Usage: $0 CORE_CHECKOUT PRIVATE_KEY PREVIOUS_SITE PAYLOAD_DIR OUTPUT_DIR" >&2; exit 64; }
-core=$(CDPATH= cd -- "$1" && pwd -P)
+[ "$#" = 5 ] || { echo "Usage: $0 SOURCES_DIR PRIVATE_KEY PREVIOUS_SITE PAYLOAD_DIR OUTPUT_DIR" >&2; exit 64; }
+sources=$(CDPATH= cd -- "$1" && pwd -P)
+tooling="$sources/tooling"
 key=$(CDPATH= cd -- "$(dirname "$2")" && printf '%s/%s' "$(pwd -P)" "$(basename "$2")")
 previous=$(CDPATH= cd -- "$3" && pwd -P)
 payload=$(CDPATH= cd -- "$4" && pwd -P)
 case "$5" in /*) out=$5 ;; *) out=$PWD/$5 ;; esac
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 
-python3 "$root/scripts/validate_feed.py" --core "$core"
-python3 "$root/scripts/validate_payload.py" "$root" "$core" "$payload"
+python3 "$root/scripts/validate_feed.py" --sources "$sources"
+python3 "$root/scripts/validate_payload.py" "$root" "$sources" "$payload"
 [ -f "$key" ] || { echo "private signing key is missing" >&2; exit 1; }
 [ -d "$previous" ] && [ ! -e "$out" ] || { echo "previous site or output is invalid" >&2; exit 1; }
 
@@ -36,17 +37,12 @@ if [ -d "$previous/preview/armv7" ]; then
     find "$previous/preview/armv7" -maxdepth 1 -type f -name 'couch-integration-*.provenance.json' -exec cp {} "$out/provenance/" \;
 fi
 
-python3 - "$root/feed-policy.json" "$core/integrations/catalog.json" <<'PY' >"$out/selected.tsv"
-import json, sys
-from pathlib import Path
-policy, catalog = map(lambda p: json.load(open(p, encoding="utf-8")), sys.argv[1:])
-entries = {entry["id"]: entry for entry in catalog["integrations"]}
-core = Path(sys.argv[2]).parents[1]
-for integration_id in policy["channels"]["preview"]["ids"]:
-    entry = entries[integration_id]
-    manifest = json.loads((core / entry["manifest"]).read_text(encoding="utf-8"))
-    print("\t".join((integration_id, manifest["version"], entry["binary"])))
-PY
+python3 "$root/scripts/validate_feed.py" --sources "$sources" --emit-selected >"$out/source-selected.tsv"
+while IFS="$(printf '\t')" read -r integration_id cargo_manifest package binary manifest repository commit sdk_commit; do
+    version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' \
+        "$sources/integrations/$integration_id/$manifest")
+    printf '%s\t%s\t%s\n' "$integration_id" "$version" "$binary"
+done <"$out/source-selected.tsv" >"$out/selected.tsv"
 
 while IFS="$(printf '\t')" read -r integration_id version binary; do
     name="couch-integration-$integration_id-$version-r0.apk"
@@ -59,14 +55,20 @@ while IFS="$(printf '\t')" read -r integration_id version binary; do
 import json, re, sys
 expected, existing = (json.load(open(path, encoding="utf-8")) for path in sys.argv[1:])
 fields = {
-    "schema", "core_commit", "id", "version", "binary", "binary_sha256",
-    "manifest_sha256",
+    "schema", "source_repository", "source_commit", "sdk_repository",
+    "sdk_commit", "tooling_repository", "tooling_commit", "id", "version",
+    "binary", "binary_sha256", "manifest_sha256",
 }
 if set(expected) != fields or set(existing) != fields:
     raise SystemExit("existing APK provenance receipt has an invalid shape")
-if not isinstance(existing["core_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", existing["core_commit"]):
-    raise SystemExit("existing APK provenance receipt has an invalid core commit")
-if any(existing[field] != expected[field] for field in fields - {"core_commit"}):
+for field in ("source_commit", "sdk_commit", "tooling_commit"):
+    if not isinstance(existing[field], str) or not re.fullmatch(r"[0-9a-f]{40}", existing[field]):
+        raise SystemExit(f"existing APK provenance receipt has an invalid {field}")
+for field in ("source_repository", "sdk_repository", "tooling_repository"):
+    if not isinstance(existing[field], str) or not existing[field].startswith("https://github.com/dangerouslaser/"):
+        raise SystemExit(f"existing APK provenance receipt has an invalid {field}")
+identity = {"id", "version", "binary", "binary_sha256", "manifest_sha256"}
+if any(existing[field] != expected[field] for field in identity):
     raise SystemExit("existing APK immutable provenance differs from approved payload")
 PY
         continue
@@ -77,7 +79,7 @@ PY
     # The basename is part of the APK signature key identity. It must remain
     # couch-integrations.rsa, matching couch-integrations.rsa.pub.
     docker run --rm --platform linux/arm/v7 \
-        -v "$core:/src:ro" -v "$out:/out" \
+        -v "$tooling:/src:ro" -v "$out:/out" \
         -v "$key:/couch-integrations.rsa:ro" \
         -v "$root/keys/couch-integrations.rsa.pub:/couch-integrations.rsa.pub:ro" \
         alpine:3.21 sh -ec '
@@ -94,7 +96,7 @@ PY
 done <"$out/selected.tsv"
 
 docker run --rm --platform linux/arm/v7 \
-    -v "$core:/src:ro" -v "$out:/out" \
+    -v "$tooling:/src:ro" -v "$out:/out" \
     -v "$key:/couch-integrations.rsa:ro" \
     -v "$root/keys/couch-integrations.rsa.pub:/couch-integrations.rsa.pub:ro" \
     alpine:3.21 sh -ec '
@@ -112,10 +114,10 @@ mv "$out/stable-build/armv7" "$out/stable/armv7"
 cp "$out/provenance"/*.provenance.json "$out/preview/armv7/"
 cp "$root/keys/couch-integrations.rsa.pub" "$out/preview/couch-integrations.rsa.pub"
 cp "$root/keys/couch-integrations.rsa.pub" "$out/stable/couch-integrations.rsa.pub"
-printf '%s\n' "$(git -C "$core" rev-parse HEAD)" >"$out/preview/CORE_COMMIT"
-printf '%s\n' "$(git -C "$core" rev-parse HEAD)" >"$out/stable/CORE_COMMIT"
+cp "$root/source-pin.json" "$out/preview/SOURCE_PINS.json"
+cp "$root/source-pin.json" "$out/stable/SOURCE_PINS.json"
 
 # Pages receives only signed indexes/packages, public keys, provenance receipts,
 # and static landing pages. Never upload unsigned build intermediates.
 rm -rf "$out/packages" "$out/provenance" "$out/new" "$out/payload" \
-    "$out/repository" "$out/stable-build" "$out/selected.tsv"
+    "$out/repository" "$out/stable-build" "$out/source-selected.tsv" "$out/selected.tsv"

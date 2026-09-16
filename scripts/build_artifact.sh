@@ -1,59 +1,56 @@
 #!/bin/sh
-# Build only the channel-selected ARM payloads. This is deliberately unsigned
-# and safe for pull-request runners; signing is confined to publish.sh.
+# Build only channel-selected ARM payloads. This is deliberately unsigned;
+# signing remains confined to publish.sh and its protected environment.
 set -eu
 
-[ "$#" = 2 ] || { echo "Usage: $0 CORE_CHECKOUT OUTPUT_DIR" >&2; exit 64; }
-core=$1
+[ "$#" = 2 ] || { echo "Usage: $0 SOURCES_DIR OUTPUT_DIR" >&2; exit 64; }
+sources=$(CDPATH= cd -- "$1" && pwd -P)
 out=$2
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
+tooling="$sources/tooling"
 
-python3 "$root/scripts/validate_feed.py" --core "$core"
+python3 "$root/scripts/validate_feed.py" --sources "$sources"
 [ ! -e "$out" ] || { echo "output already exists: $out" >&2; exit 1; }
 mkdir -p "$out"
+python3 "$root/scripts/validate_feed.py" --sources "$sources" --emit-selected >"$out/selected.tsv"
+cp "$root/source-pin.json" "$out/SOURCE_PINS.json"
 
-# The current policy deliberately has one preview package. Keep the selection
-# in JSON so a future package cannot bypass validate_feed's tier check.
-python3 - "$root/feed-policy.json" "$core/integrations/catalog.json" <<'PY' >"$out/selected.tsv"
-import json, sys
-policy, catalog = map(lambda p: json.load(open(p, encoding="utf-8")), sys.argv[1:])
-entries = {entry["id"]: entry for entry in catalog["integrations"]}
-for integration_id in policy["channels"]["preview"]["ids"]:
-    entry = entries[integration_id]
-    print("\t".join((integration_id, entry["cargo_package"], entry["binary"], entry["manifest"])))
-PY
-
-while IFS="$(printf '\t')" read -r integration_id package binary manifest; do
+while IFS="$(printf '\t')" read -r integration_id cargo_manifest package binary manifest repository commit sdk_commit; do
+    source="$sources/integrations/$integration_id"
     (
-        cd "$core"
+        cd "$tooling"
         . tools/arm-cc-env.sh
-        cd clients
-        cargo build --locked --release --target armv7-unknown-linux-musleabihf -p "$package" --bin "$binary"
+        cd "$source"
+        cargo build --locked --release --target armv7-unknown-linux-musleabihf \
+            --manifest-path "$cargo_manifest" -p "$package" --bin "$binary"
     )
     mkdir -p "$out/$integration_id"
-    cp "$core/clients/target/armv7-unknown-linux-musleabihf/release/$binary" "$out/$integration_id/$binary"
-    cp "$core/$manifest" "$out/$integration_id/manifest.json"
+    cp "$source/target/armv7-unknown-linux-musleabihf/release/$binary" "$out/$integration_id/$binary"
+    cp "$source/$manifest" "$out/$integration_id/manifest.json"
     sha256sum "$out/$integration_id/$binary" "$out/$integration_id/manifest.json"
-done <"$out/selected.tsv" >"$out/SHA256SUMS"
-printf '%s\n' "$(git -C "$core" rev-parse HEAD)" >"$out/CORE_COMMIT"
-python3 - "$out" <<'PY'
+    python3 - "$out/$integration_id" "$integration_id" "$binary" "$repository" "$commit" \
+        "$sdk_commit" "$root/source-pin.json" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
 
-out = Path(sys.argv[1])
-commit = (out / "CORE_COMMIT").read_text(encoding="utf-8").strip()
-for line in (out / "selected.tsv").read_text(encoding="utf-8").splitlines():
-    integration_id, _package, binary, _manifest = line.split("\t")
-    payload = out / integration_id
-    manifest = json.loads((payload / "manifest.json").read_text(encoding="utf-8"))
-    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-    (payload / "provenance.json").write_text(json.dumps({
-        "schema": 1,
-        "core_commit": commit,
-        "id": integration_id,
-        "version": manifest["version"],
-        "binary": binary,
-        "binary_sha256": digest(payload / binary),
-        "manifest_sha256": digest(payload / "manifest.json"),
-    }, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+payload, integration_id, binary, repository, commit, sdk_commit, pins_path = sys.argv[1:]
+payload = Path(payload)
+pins = json.loads(Path(pins_path).read_text(encoding="utf-8"))
+manifest = json.loads((payload / "manifest.json").read_text(encoding="utf-8"))
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+(payload / "provenance.json").write_text(json.dumps({
+    "schema": 2,
+    "source_repository": repository,
+    "source_commit": commit,
+    "sdk_repository": pins["tooling"]["repository"],
+    "sdk_commit": sdk_commit,
+    "tooling_repository": pins["tooling"]["repository"],
+    "tooling_commit": pins["tooling"]["commit"],
+    "id": integration_id,
+    "version": manifest["version"],
+    "binary": binary,
+    "binary_sha256": digest(payload / binary),
+    "manifest_sha256": digest(payload / "manifest.json"),
+}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
+done <"$out/selected.tsv" >"$out/SHA256SUMS"

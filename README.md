@@ -5,22 +5,22 @@ installed Couch integrations. It is intentionally separate from the Couch
 runtime source so a reviewed integration can ship without a complete runtime
 release.
 
-The feed is pinned to one full Couch commit in
-[`source-pin.json`](source-pin.json). The pin is part of admission: the
-workflow checks out that exact object, validates the core catalog and its named
-tests, builds ARMv7 payloads, and runs Couch's native package-admission smoke
-test. Changing the pin therefore requires the same reviewable evidence as a
-package change.
+[`source-pin.json`](source-pin.json) records one immutable tooling pin and one
+immutable repository and commit for each curated integration. Denon is sourced
+from its own repository; Couch supplies the shared SDK, host protocol, package
+builder, and package-store tests. Admission checks out every exact object,
+validates each repository's `integration.json`, runs its locked test suite,
+builds ARMv7 payloads, and exercises the native package path. Changing any pin
+therefore requires the same reviewable evidence as a package change.
 
 ## Channels
 
-`preview` currently publishes only the real Denon integration. Echo is a
-synthetic, `test-only` catalog entry and is rejected by the feed policy even
-though the core admission harness tests it as a fixture.
+`preview` currently publishes only the real Denon integration. Synthetic or
+`test-only` sources are rejected even if a policy tries to select them.
 
 `stable` is deliberately an empty signed index. It contains no integration
-packages until a production-tier integration has validated hardware evidence in
-the pinned core catalog. The stable index is valid but has no installable packages.
+packages until a production-tier integration has validated hardware evidence.
+The stable index is valid but has no installable packages.
 
 The repository URLs are:
 
@@ -58,11 +58,11 @@ repository, an artifact, a pull-request workflow, or a package.
 is exactly named `admission`, the check to require in this repository's branch
 ruleset. It has three layers:
 
-1. source pin and channel policy;
-2. exact core catalog validation, package cases, host protocol tests, and
-   package-store tests;
-3. ARMv7 builds, QEMU Alpine APK build/index/install, and untrusted/tampered
-   package rejection through the pinned core smoke harness.
+1. all source pins and channel policy;
+2. each independent repository's locked admission tests plus the pinned shared
+   host protocol and package-store tests;
+3. ARMv7 builds, QEMU Alpine APK build/index/install, and immutable provenance
+   and tamper rejection.
 
 The unsigned ARM payload is uploaded only as a short-lived review artifact.
 It cannot sign or deploy a feed.
@@ -82,12 +82,13 @@ the Pages package set and in the release archive so a Couch slot can roll back.
 
 ## Local review
 
-After checking out the pinned core source beside this repository:
+Materialize the exact source graph, then validate it:
 
 ```sh
-python3 scripts/validate_feed.py --core ../couch
+scripts/checkout_sources.sh ../integration-sources
+python3 scripts/validate_feed.py --sources ../integration-sources
 python3 -m unittest discover -s tests -v
-sh -n scripts/build_artifact.sh scripts/publish.sh
+sh -n scripts/checkout_sources.sh scripts/build_artifact.sh scripts/publish.sh
 ```
 
 The signed build needs Docker with ARMv7 QEMU support, Alpine `abuild` tools,
@@ -123,9 +124,11 @@ repository registry or repository-management UI. Direct `apk add` bypasses
 Couch validation and activation and is not the integration installation path.
 See the [developer packaging guide](https://couch-os.dev/developers/packaging.html).
 
-Integration source and catalog contributions currently belong in
-[dangerouslaser/couch](https://github.com/dangerouslaser/couch); this repository
-owns the reviewed source pin, distribution policy, and publishing workflow.
+Each integration owns its source, lock file, `integration.json`, runtime
+manifest, and admission suite in its pinned repository. The
+[Couch repository](https://github.com/dangerouslaser/couch) owns the reusable
+SDK, protocol, admission harness, and package tooling. This repository owns the
+reviewed source graph, distribution policy, and publishing workflow.
 
 ## Publish an admitted revision
 
@@ -139,6 +142,7 @@ gh workflow run publish.yml --repo dangerouslaser/couch-integrations \
 Require `admission` from GitHub Actions (app ID `15368`) in branch protection,
 with up-to-date branches and administrators included. Signing and Pages
 environments permit `main` only. Repeating publication with the same admitted
-artifact reuses existing APK bytes and regenerates signed indexes. A changed
-payload or immutable provenance field at an existing version requires a version
-bump; a retained historical source commit does not replace its older receipt.
+artifact reuses existing APK bytes and regenerates signed indexes. Changed
+binary or manifest bytes at an existing version require a version bump. A
+retained historical package keeps its original source, SDK, and tooling receipt
+even when a later feed revision advances those pins.

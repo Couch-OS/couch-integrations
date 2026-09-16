@@ -16,46 +16,63 @@ class PayloadValidationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.feed = self.root / "feed"
-        self.core = self.root / "core"
+        self.sources = self.root / "sources"
         self.payload = self.root / "artifact"
-        self.commit = "a" * 40
+        self.tooling_commit = "a" * 40
+        self.source_commit = "b" * 40
         self.integration_id = "denon"
         self.binary_name = "couch-plugin-denon"
-        self.manifest_name = "clients/couch-denon/plugin.json"
+        self.source = self.sources / "integrations" / self.integration_id
         self.manifest = {
             "protocol_version": 1,
             "id": self.integration_id,
             "label": "Denon AVR",
-            "version": "0.1.0",
+            "version": "0.1.1",
             "executable": f"bin/{self.binary_name}",
             "capabilities": [],
             "settings": [],
             "supports_inputs": True,
         }
-
-        (self.feed).mkdir()
-        (self.core / "integrations").mkdir(parents=True)
-        (self.core / Path(self.manifest_name).parent).mkdir(parents=True)
+        self.pins = {
+            "schema": 2,
+            "tooling": {
+                "repository": "https://github.com/dangerouslaser/couch.git",
+                "commit": self.tooling_commit,
+            },
+            "integrations": {
+                self.integration_id: {
+                    "repository": "https://github.com/dangerouslaser/couch-integration-denon.git",
+                    "commit": self.source_commit,
+                }
+            },
+        }
+        self.feed.mkdir()
+        self.source.mkdir(parents=True)
         (self.payload / self.integration_id).mkdir(parents=True)
-        self.write_json(self.feed / "source-pin.json", {"commit": self.commit})
+        self.write_json(self.feed / "source-pin.json", self.pins)
         self.write_json(
             self.feed / "feed-policy.json",
             {"channels": {"preview": {"ids": [self.integration_id]}}},
         )
         self.write_json(
-            self.core / "integrations/catalog.json",
+            self.source / "integration.json",
             {
-                "integrations": [
-                    {
-                        "id": self.integration_id,
-                        "manifest": self.manifest_name,
-                        "binary": self.binary_name,
-                    }
-                ]
+                "id": self.integration_id,
+                "cargo_manifest": "Cargo.toml",
+                "binary": self.binary_name,
+                "manifest": "plugin.json",
             },
         )
-        self.write_json(self.core / self.manifest_name, self.manifest)
-        (self.payload / "CORE_COMMIT").write_text(f"{self.commit}\n", encoding="utf-8")
+        (self.source / "Cargo.toml").write_text(
+            f'''[package]
+name = "couch-denon"
+[dependencies]
+couch-sdk = {{ git = "https://github.com/dangerouslaser/couch.git", rev = "{self.tooling_commit}" }}
+''',
+            encoding="utf-8",
+        )
+        self.write_json(self.source / "plugin.json", self.manifest)
+        self.write_json(self.payload / "SOURCE_PINS.json", self.pins)
         self.binary = self.payload / self.integration_id / self.binary_name
         self.binary.write_bytes(b"\x7fELF\x01armv7 fixture binary")
         self.artifact_manifest = self.payload / self.integration_id / "manifest.json"
@@ -76,8 +93,13 @@ class PayloadValidationTests(unittest.TestCase):
 
     def write_provenance(self, **changes):
         record = {
-            "schema": 1,
-            "core_commit": self.commit,
+            "schema": 2,
+            "source_repository": self.pins["integrations"][self.integration_id]["repository"],
+            "source_commit": self.source_commit,
+            "sdk_repository": self.pins["tooling"]["repository"],
+            "sdk_commit": self.tooling_commit,
+            "tooling_repository": self.pins["tooling"]["repository"],
+            "tooling_commit": self.tooling_commit,
             "id": self.integration_id,
             "version": self.manifest["version"],
             "binary": self.binary_name,
@@ -89,13 +111,7 @@ class PayloadValidationTests(unittest.TestCase):
 
     def validate(self):
         return subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                str(self.feed),
-                str(self.core),
-                str(self.payload),
-            ],
+            [sys.executable, str(SCRIPT), str(self.feed), str(self.sources), str(self.payload)],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -115,22 +131,25 @@ class PayloadValidationTests(unittest.TestCase):
         self.binary.write_bytes(self.binary.read_bytes() + b"tampered")
         self.assert_rejected(self.validate())
 
-    def test_changed_manifest_is_rejected_even_with_matching_artifact_receipt(self):
+    def test_changed_manifest_is_rejected_even_with_matching_receipt(self):
         changed = dict(self.manifest, version="9.9.9")
         self.write_json(self.artifact_manifest, changed)
-        self.write_provenance(
-            version=changed["version"],
-            manifest_sha256=self.digest(self.artifact_manifest),
-        )
+        self.write_provenance(version=changed["version"], manifest_sha256=self.digest(self.artifact_manifest))
         self.assert_rejected(self.validate())
 
-    def test_stale_core_commit_is_rejected(self):
-        (self.payload / "CORE_COMMIT").write_text(f"{'b' * 40}\n", encoding="utf-8")
-        self.assert_rejected(self.validate(), "core commit does not match source pin")
+    def test_stale_source_pin_snapshot_is_rejected(self):
+        stale = dict(self.pins)
+        stale["integrations"] = {self.integration_id: dict(self.pins["integrations"][self.integration_id], commit="c" * 40)}
+        self.write_json(self.payload / "SOURCE_PINS.json", stale)
+        self.assert_rejected(self.validate(), "source pins do not match")
 
-    def test_altered_provenance_is_rejected(self):
-        self.write_provenance(binary_sha256="0" * 64)
+    def test_altered_source_provenance_is_rejected(self):
+        self.write_provenance(source_commit="c" * 40)
         self.assert_rejected(self.validate())
+
+    def test_unselected_payload_directory_is_rejected(self):
+        (self.payload / "unexpected").mkdir()
+        self.assert_rejected(self.validate(), "unselected integration")
 
 
 if __name__ == "__main__":
