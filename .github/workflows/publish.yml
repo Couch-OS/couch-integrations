@@ -78,7 +78,7 @@ jobs:
           # the newest one; download errors must not silently discard history.
           tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
             --json tagName,isDraft,publishedAt \
-            --jq 'map(select(.isDraft == false and (.tagName | startswith("integration-")))) | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
+            --jq 'map(select(.isDraft == false and (.tagName | startswith("feed-") or startswith("integration-")))) | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
           if [ -n "$tag" ]; then
             gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
               --pattern couch-integrations-preview-armv7.tar.gz \
@@ -96,14 +96,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version=$(python3 -c 'import json; print(json.load(open("../couch/clients/couch-denon/plugin.json"))["version"])')
-          tag="integration-denon-v$version"
+          # A feed revision can add any integration without changing Denon.
+          # Every published revision therefore gets a complete retained archive.
+          tag="feed-$GITHUB_SHA"
           tar -C "$RUNNER_TEMP/site" -czf "$RUNNER_TEMP/couch-integrations-preview-armv7.tar.gz" preview
           if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP/couch-integrations-preview-armv7.tar.gz" \
               "$RUNNER_TEMP/site/preview/armv7/APKINDEX.tar.gz" \
-              "$RUNNER_TEMP/site/preview/armv7/couch-integration-denon-$version-r0.apk" \
-              --target "$GITHUB_SHA" --title "Couch integration feed: Denon $version" \
+              "$RUNNER_TEMP/site/preview/armv7/"*.apk \
+              --target "$GITHUB_SHA" --title "Couch integration feed ${GITHUB_SHA:0:12}" \
               --notes "Signed ARMv7 preview feed built from the pinned Couch commit."
           fi
       - name: Remove the ephemeral private key

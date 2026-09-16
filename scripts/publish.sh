@@ -56,10 +56,18 @@ while IFS="$(printf '\t')" read -r integration_id version binary; do
     if [ -e "$package" ]; then
         [ -f "$provenance" ] || { echo "existing $name has no provenance receipt" >&2; exit 1; }
         python3 - "$artifact_provenance" "$provenance" <<'PY'
-import json, sys
+import json, re, sys
 expected, existing = (json.load(open(path, encoding="utf-8")) for path in sys.argv[1:])
-if expected != existing:
-    raise SystemExit("existing APK provenance differs from approved payload")
+fields = {
+    "schema", "core_commit", "id", "version", "binary", "binary_sha256",
+    "manifest_sha256",
+}
+if set(expected) != fields or set(existing) != fields:
+    raise SystemExit("existing APK provenance receipt has an invalid shape")
+if not isinstance(existing["core_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", existing["core_commit"]):
+    raise SystemExit("existing APK provenance receipt has an invalid core commit")
+if any(existing[field] != expected[field] for field in fields - {"core_commit"}):
+    raise SystemExit("existing APK immutable provenance differs from approved payload")
 PY
         continue
     fi

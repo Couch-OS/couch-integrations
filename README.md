@@ -73,8 +73,7 @@ The workflow requires a successful `Feed admission` run for the exact main
 commit and downloads that run’s unsigned payload artifact. It does not rebuild
 or execute the integration while the signing key is present. The job
 checks the public/private key match, preserves all previously published APKs,
-re-signs the complete preview index, creates a versioned GitHub Release archive
-when necessary, and uploads the complete site through GitHub's official Pages
+re-signs the complete preview index, creates a GitHub Release archive for each feed revision, and uploads the complete site through GitHub's official Pages
 artifact/deployment workflow.
 
 Each existing `couch-integration-ID-VERSION-r0.apk` is treated as immutable:
@@ -141,4 +140,5 @@ Require `admission` from GitHub Actions (app ID `15368`) in branch protection,
 with up-to-date branches and administrators included. Signing and Pages
 environments permit `main` only. Repeating publication with the same admitted
 artifact reuses existing APK bytes and regenerates signed indexes. A changed
-payload or provenance at an existing version requires a version bump.
+payload or immutable provenance field at an existing version requires a version
+bump; a retained historical source commit does not replace its older receipt.
