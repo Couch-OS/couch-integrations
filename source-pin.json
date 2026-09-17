@@ -1,13 +1,13 @@
 {
   "schema": 2,
   "tooling": {
-    "repository": "https://github.com/dangerouslaser/couch.git",
+    "repository": "https://github.com/Couch-OS/couch.git",
     "commit": "5e0cc20adad6ea54032002a8adf0888e80499bca"
   },
   "integrations": {
     "denon": {
       "repository": "https://github.com/Couch-OS/couch-integration-denon.git",
-      "commit": "828719e054d7855d2a9b374021cbc1b44db871d3"
+      "commit": "234f19ab2d84e265ed5fe376648bc25c70940f6d"
     }
   }
 }

@@ -15,10 +15,13 @@ therefore requires the same reviewable evidence as a package change.
 
 The Couch repositories are moving from `dangerouslaser` to the
 [Couch-OS](https://github.com/Couch-OS) organization, and a pin may name either
-owner with exactly that casing. Denon is already pinned at
-[`Couch-OS/couch-integration-denon`](https://github.com/Couch-OS/couch-integration-denon).
-The Couch tooling pin stays at `dangerouslaser/couch` until that repository
-moves; GitHub redirects the old Git URL afterwards.
+owner with exactly that casing. Denon is pinned at
+[`Couch-OS/couch-integration-denon`](https://github.com/Couch-OS/couch-integration-denon),
+and the Couch tooling pin now names
+[`Couch-OS/couch`](https://github.com/Couch-OS/couch) at the same commit. GitHub
+redirects a transferred Git URL only until a repository exists again at the old
+name, so a pin must not rely on that redirect. This feed repository itself has
+not moved; its own workflow and Pages URLs still name `dangerouslaser`.
 
 ## Channels
 
@@ -139,7 +142,7 @@ See the [developer packaging guide](https://couch-os.dev/developers/packaging.ht
 
 Each integration owns its source, lock file, `integration.json`, runtime
 manifest, and admission suite in its pinned repository. The
-[Couch repository](https://github.com/dangerouslaser/couch) owns the reusable
+[Couch repository](https://github.com/Couch-OS/couch) owns the reusable
 SDK, protocol, admission harness, and package tooling. This repository owns the
 reviewed source graph, distribution policy, and publishing workflow.
 
