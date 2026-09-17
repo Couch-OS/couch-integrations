@@ -12,8 +12,23 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMIT = re.compile(r"[0-9a-f]{40}")
-REPOSITORY = re.compile(r"https://github\.com/dangerouslaser/[a-z0-9][a-z0-9._-]*\.git")
-CORE_REPOSITORY = "https://github.com/dangerouslaser/couch.git"
+# The Couch repositories are moving from dangerouslaser to the Couch-OS
+# organization. GitHub redirects transferred Git URLs, so a pin may name either
+# owner, spelled exactly as listed: one canonical URL per repository and owner.
+OWNERS = ("dangerouslaser", "Couch-OS")
+REPOSITORY = re.compile(
+    r"https://github\.com/(?P<owner>{})/(?P<name>[a-z0-9][a-z0-9._-]*)(?<!\.git)\.git".format(
+        "|".join(map(re.escape, OWNERS))
+    )
+)
+CORE_REPOSITORIES = frozenset(f"https://github.com/{owner}/couch.git" for owner in OWNERS)
+RECEIPT_FIELDS = frozenset({
+    "schema", "source_repository", "source_commit", "sdk_repository",
+    "sdk_commit", "tooling_repository", "tooling_commit", "id", "version",
+    "binary", "binary_sha256", "manifest_sha256",
+})
+RECEIPT_COMMITS = ("source_commit", "sdk_commit", "tooling_commit")
+RECEIPT_REPOSITORIES = ("source_repository", "sdk_repository", "tooling_repository")
 CHANNELS = {"preview", "stable"}
 PUBLISHABLE_TIERS = {"preview", "production"}
 METADATA_KEYS = {
@@ -73,7 +88,7 @@ def validate_pin(pin: object, context: str, *, core: bool = False) -> dict:
     if (
         not isinstance(repository, str)
         or not REPOSITORY.fullmatch(repository)
-        or (core and repository != CORE_REPOSITORY)
+        or (core and repository not in CORE_REPOSITORIES)
         or not isinstance(commit, str)
         or not COMMIT.fullmatch(commit)
         or commit == "0" * 40
@@ -124,6 +139,41 @@ def policy() -> dict:
     return value
 
 
+def repository_name(repository: object) -> str | None:
+    """Return the repository name of an allowed-owner GitHub URL, else None."""
+    match = REPOSITORY.fullmatch(repository) if isinstance(repository, str) else None
+    return match["name"] if match else None
+
+
+def validate_retained_receipt(approved: object, existing: object) -> None:
+    """Allow reuse of a published APK only when its original receipt describes
+    the approved payload's exact bytes.
+
+    Two historical differences are tolerated: a pin commit may have advanced
+    without changing the package, and a repository may have moved between the
+    allowed owners under the same name. Every other field must be identical.
+    """
+    if (
+        not isinstance(approved, dict)
+        or not isinstance(existing, dict)
+        or set(approved) != RECEIPT_FIELDS
+        or set(existing) != RECEIPT_FIELDS
+    ):
+        raise InvalidFeed("existing APK provenance receipt has an invalid shape")
+    for field in RECEIPT_COMMITS:
+        if not isinstance(existing[field], str) or not COMMIT.fullmatch(existing[field]):
+            raise InvalidFeed(f"existing APK provenance receipt has an invalid {field}")
+    for field in RECEIPT_REPOSITORIES:
+        name = repository_name(existing[field])
+        if name is None:
+            raise InvalidFeed(f"existing APK provenance receipt has an invalid {field}")
+        if name != repository_name(approved[field]):
+            raise InvalidFeed(f"existing APK {field} names a different repository than the approved payload")
+    identity = RECEIPT_FIELDS.difference(RECEIPT_COMMITS, RECEIPT_REPOSITORIES)
+    if any(existing[field] != approved[field] for field in identity):
+        raise InvalidFeed("existing APK immutable provenance differs from approved payload")
+
+
 def validate_key() -> None:
     path = ROOT / "keys/couch-integrations.rsa.pub"
     try:
@@ -161,14 +211,14 @@ def contained_file(source: Path, relative: object, context: str) -> Path:
     return resolved
 
 
-def dependency_revision(dependency: object, context: str) -> str:
+def dependency_pin(dependency: object, context: str) -> tuple[str, str]:
     if not isinstance(dependency, dict):
         raise InvalidFeed(f"{context} must be a pinned Git dependency")
-    if dependency.get("git") != CORE_REPOSITORY or not COMMIT.fullmatch(str(dependency.get("rev", ""))):
+    if dependency.get("git") not in CORE_REPOSITORIES or not COMMIT.fullmatch(str(dependency.get("rev", ""))):
         raise InvalidFeed(f"{context} must pin the Couch repository at a full commit")
     if "path" in dependency or "branch" in dependency or "tag" in dependency:
         raise InvalidFeed(f"{context} cannot use a local path, branch, or tag")
-    return dependency["rev"]
+    return dependency["git"], dependency["rev"]
 
 
 def validate_integration(source: Path, integration_id: str, pin: dict) -> dict:
@@ -206,16 +256,18 @@ def validate_integration(source: Path, integration_id: str, pin: dict) -> dict:
         declaration = re.compile(rf"#\[test\]\s*fn\s+{re.escape(case)}\s*\(")
         if not declaration.search(admission) or harness_call not in admission:
             raise InvalidFeed(f"{integration_id} admission must reuse the shared {case} case")
-    revisions = {
-        dependency_revision(cargo.get("dependencies", {}).get(name), f"{integration_id} {name}")
+    dependencies = {
+        dependency_pin(cargo.get(table, {}).get(name), f"{integration_id} {prefix}{name}")
+        for table, prefix in (("dependencies", ""), ("dev-dependencies", "dev "))
         for name in ("couch-plugin", "couch-sdk")
     }
-    revisions.update(
-        dependency_revision(cargo.get("dev-dependencies", {}).get(name), f"{integration_id} dev {name}")
-        for name in ("couch-plugin", "couch-sdk")
-    )
+    revisions = {revision for _, revision in dependencies}
     if len(revisions) != 1:
         raise InvalidFeed(f"{integration_id} SDK dependencies do not share one revision")
+    # Either core URL resolves to the same repository, but Cargo treats two
+    # spellings as two sources and would build duplicate protocol crates.
+    if len({repository for repository, _ in dependencies}) != 1:
+        raise InvalidFeed(f"{integration_id} SDK dependencies do not share one Couch repository URL")
     metadata = dict(metadata)
     metadata["sdk_commit"] = revisions.pop()
     manifest = load_json(manifest_path)
@@ -265,11 +317,18 @@ def main() -> int:
     parser.add_argument("--pins-only", action="store_true", help="validate committed pins without checkouts")
     parser.add_argument("--emit-pins", action="store_true", help="emit validated checkout pins as TSV")
     parser.add_argument("--emit-selected", action="store_true", help="emit selected integration metadata as TSV")
+    parser.add_argument(
+        "--retained-receipt", nargs=2, type=Path, metavar=("APPROVED", "EXISTING"),
+        help="check that a published APK receipt may be reused for an approved payload receipt",
+    )
     args = parser.parse_args()
     try:
         pins = source_pins()
         selected_policy = policy()
         validate_key()
+        if args.retained_receipt:
+            validate_retained_receipt(*map(load_json, args.retained_receipt))
+            return 0
         if args.emit_pins:
             print("\t".join(("tooling", pins["tooling"]["repository"], pins["tooling"]["commit"])))
             for integration_id, pin in sorted(pins["integrations"].items()):

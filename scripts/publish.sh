@@ -51,26 +51,11 @@ while IFS="$(printf '\t')" read -r integration_id version binary; do
     artifact_provenance="$payload/$integration_id/provenance.json"
     if [ -e "$package" ]; then
         [ -f "$provenance" ] || { echo "existing $name has no provenance receipt" >&2; exit 1; }
-        python3 - "$artifact_provenance" "$provenance" <<'PY'
-import json, re, sys
-expected, existing = (json.load(open(path, encoding="utf-8")) for path in sys.argv[1:])
-fields = {
-    "schema", "source_repository", "source_commit", "sdk_repository",
-    "sdk_commit", "tooling_repository", "tooling_commit", "id", "version",
-    "binary", "binary_sha256", "manifest_sha256",
-}
-if set(expected) != fields or set(existing) != fields:
-    raise SystemExit("existing APK provenance receipt has an invalid shape")
-for field in ("source_commit", "sdk_commit", "tooling_commit"):
-    if not isinstance(existing[field], str) or not re.fullmatch(r"[0-9a-f]{40}", existing[field]):
-        raise SystemExit(f"existing APK provenance receipt has an invalid {field}")
-for field in ("source_repository", "sdk_repository", "tooling_repository"):
-    if not isinstance(existing[field], str) or not existing[field].startswith("https://github.com/dangerouslaser/"):
-        raise SystemExit(f"existing APK provenance receipt has an invalid {field}")
-identity = {"id", "version", "binary", "binary_sha256", "manifest_sha256"}
-if any(existing[field] != expected[field] for field in identity):
-    raise SystemExit("existing APK immutable provenance differs from approved payload")
-PY
+        # Reuse keeps the original receipt. It may record an older pin commit or
+        # the same repository before its owner moved; see validate_feed.py.
+        # Keep stdin away from the checker: it is this loop's selected.tsv.
+        python3 "$root/scripts/validate_feed.py" \
+            --retained-receipt "$artifact_provenance" "$provenance" </dev/null
         continue
     fi
     mkdir -p "$out/payload"

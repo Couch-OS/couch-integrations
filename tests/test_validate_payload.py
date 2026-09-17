@@ -41,7 +41,7 @@ class PayloadValidationTests(unittest.TestCase):
             },
             "integrations": {
                 self.integration_id: {
-                    "repository": "https://github.com/dangerouslaser/couch-integration-denon.git",
+                    "repository": "https://github.com/Couch-OS/couch-integration-denon.git",
                     "commit": self.source_commit,
                 }
             },
@@ -142,6 +142,18 @@ couch-sdk = {{ git = "https://github.com/dangerouslaser/couch.git", rev = "{self
         stale["integrations"] = {self.integration_id: dict(self.pins["integrations"][self.integration_id], commit="c" * 40)}
         self.write_json(self.payload / "SOURCE_PINS.json", stale)
         self.assert_rejected(self.validate(), "source pins do not match")
+
+    def test_payload_built_before_an_owner_move_is_rejected(self):
+        # Owner-move equivalence applies only to retained published receipts.
+        # A new payload must be admitted for the exact reviewed repository URL.
+        legacy = "https://github.com/dangerouslaser/couch-integration-denon.git"
+        stale = dict(self.pins)
+        stale["integrations"] = {self.integration_id: dict(self.pins["integrations"][self.integration_id], repository=legacy)}
+        self.write_json(self.payload / "SOURCE_PINS.json", stale)
+        self.assert_rejected(self.validate(), "source pins do not match")
+        self.write_json(self.payload / "SOURCE_PINS.json", self.pins)
+        self.write_provenance(source_repository=legacy)
+        self.assert_rejected(self.validate())
 
     def test_altered_source_provenance_is_rejected(self):
         self.write_provenance(source_commit="c" * 40)
