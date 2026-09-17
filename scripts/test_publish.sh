@@ -125,6 +125,49 @@ test "$third_digest" = "$first_digest"
 cmp -s "$package" "$third_package"
 cmp -s "$old_receipt" "$third_receipt"
 
+# The Couch repositories move between the dangerouslaser and Couch-OS owners.
+# A receipt written before a move names the same repositories under the other
+# owner. Swap every recorded owner: publishing must still reuse the same APK and
+# keep that original receipt byte for byte.
+rewrite_receipt() {
+    python3 - "$@" <<'PY'
+import json, sys
+from pathlib import Path
+path, mode = Path(sys.argv[1]), sys.argv[2]
+record = json.loads(path.read_text(encoding="utf-8"))
+owners = {"https://github.com/dangerouslaser/": "https://github.com/Couch-OS/",
+          "https://github.com/Couch-OS/": "https://github.com/dangerouslaser/"}
+for field in ("source_repository", "sdk_repository", "tooling_repository"):
+    prefix = next(prefix for prefix in owners if record[field].startswith(prefix))
+    record[field] = owners[prefix] + record[field][len(prefix):]
+if mode == "renamed":
+    record["source_repository"] = record["source_repository"].removesuffix(".git") + "-fork.git"
+path.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+PY
+}
+moved_history="$work/owner-moved-history"
+cp -a "$work/first" "$moved_history"
+moved_receipt="$moved_history/preview/armv7/$(basename "${package%.apk}").provenance.json"
+rewrite_receipt "$moved_receipt" moved
+if cmp -s "$moved_receipt" "$work/first/preview/armv7/$(basename "$moved_receipt")"; then
+    echo "owner-move fixture did not change the receipt" >&2
+    exit 1
+fi
+"$test_feed/scripts/publish.sh" "$sources" "$key" "$moved_history" "$payload" "$work/owner-moved"
+cmp -s "$package" "$work/owner-moved/preview/armv7/$(basename "$package")"
+cmp -s "$moved_receipt" "$work/owner-moved/preview/armv7/$(basename "$moved_receipt")"
+
+# Owner equivalence is not a repository wildcard. A receipt for the same version
+# from a differently named repository must still stop publication.
+renamed_history="$work/renamed-history"
+cp -a "$work/first" "$renamed_history"
+rewrite_receipt "$renamed_history/preview/armv7/$(basename "$moved_receipt")" renamed
+if "$test_feed/scripts/publish.sh" "$sources" "$key" "$renamed_history" "$payload" "$work/renamed"; then
+    echo "publisher reused an APK whose receipt names another repository" >&2
+    exit 1
+fi
+test ! -e "$work/renamed/preview/armv7/$(basename "$package")"
+
 # Model a payload whose binary and receipt were both modified after admission.
 # Its self-consistent updated digest reaches the immutable-package guard, which
 # must reject this same version instead of overwriting the published artifact.

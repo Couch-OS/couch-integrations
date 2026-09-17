@@ -6,7 +6,7 @@
   },
   "integrations": {
     "denon": {
-      "repository": "https://github.com/dangerouslaser/couch-integration-denon.git",
+      "repository": "https://github.com/Couch-OS/couch-integration-denon.git",
       "commit": "828719e054d7855d2a9b374021cbc1b44db871d3"
     }
   }

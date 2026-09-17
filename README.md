@@ -13,6 +13,13 @@ validates each repository's `integration.json`, runs its locked test suite,
 builds ARMv7 payloads, and exercises the native package path. Changing any pin
 therefore requires the same reviewable evidence as a package change.
 
+The Couch repositories are moving from `dangerouslaser` to the
+[Couch-OS](https://github.com/Couch-OS) organization, and a pin may name either
+owner with exactly that casing. Denon is already pinned at
+[`Couch-OS/couch-integration-denon`](https://github.com/Couch-OS/couch-integration-denon).
+The Couch tooling pin stays at `dangerouslaser/couch` until that repository
+moves; GitHub redirects the old Git URL afterwards.
+
 ## Channels
 
 `preview` currently publishes only the real Denon integration. Synthetic or
@@ -25,9 +32,15 @@ The stable index is valid but has no installable packages.
 The repository URLs are:
 
 ```text
-https://dangerouslaser.github.io/couch-integrations/preview
-https://dangerouslaser.github.io/couch-integrations/stable   # intentionally empty
+https://packages.couch-os.dev/preview
+https://packages.couch-os.dev/stable   # intentionally empty
 ```
+
+`packages.couch-os.dev` goes live once its DNS record and this repository's
+GitHub Pages custom domain are configured. Until then the same feed is served at
+`https://dangerouslaser.github.io/couch-integrations/{preview,stable}`, which
+redirects to `https://packages.couch-os.dev` afterwards. The published site uses
+only relative links, so it works from either hostname.
 
 The Couch installer appends `armv7` when it fetches `APKINDEX.tar.gz`.
 
@@ -39,7 +52,7 @@ publish job derives the public key from that secret and compares its DER form
 before it signs anything. A key mismatch intentionally makes validation fail.
 
 The published public key is available at
-<https://dangerouslaser.github.io/couch-integrations/preview/couch-integrations.rsa.pub>.
+<https://packages.couch-os.dev/preview/couch-integrations.rsa.pub>.
 Its PEM-file SHA-256 fingerprint is:
 
 ```text
@@ -104,7 +117,7 @@ integration-capable runtime before running these commands inside Alpine
 ```sh
 /opt/couch/runtime/current/couch-confd integrations \
   install-repository couch-integration-denon \
-  --repository https://dangerouslaser.github.io/couch-integrations/preview
+  --repository https://packages.couch-os.dev/preview
 ```
 
 For your own feed, provision its public key in a separate directory and name
@@ -145,4 +158,7 @@ environments permit `main` only. Repeating publication with the same admitted
 artifact reuses existing APK bytes and regenerates signed indexes. Changed
 binary or manifest bytes at an existing version require a version bump. A
 retained historical package keeps its original source, SDK, and tooling receipt
-even when a later feed revision advances those pins.
+even when a later feed revision advances those pins, or names the same
+repository under the other allowed owner after a move from `dangerouslaser` to
+`Couch-OS`. A receipt that names a differently named repository, or whose
+package identity or bytes differ, still stops publication.
