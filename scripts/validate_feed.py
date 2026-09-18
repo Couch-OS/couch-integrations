@@ -22,6 +22,10 @@ REPOSITORY = re.compile(
     )
 )
 CORE_REPOSITORIES = frozenset(f"https://github.com/{owner}/couch.git" for owner in OWNERS)
+# The plugin protocol versions a released Couch core speaks
+# (clients/couch-plugin PROTOCOL_VERSION). Version 2 first shipped in
+# v0.1.0-alpha.20260918.177.
+PROTOCOL_VERSIONS = frozenset({1, 2})
 RECEIPT_FIELDS = frozenset({
     "schema", "source_repository", "source_commit", "sdk_repository",
     "sdk_commit", "tooling_repository", "tooling_commit", "id", "version",
@@ -228,7 +232,8 @@ def validate_integration(source: Path, integration_id: str, pin: dict) -> dict:
     exact_keys(metadata, METADATA_KEYS, f"{integration_id} integration.json")
     if (
         metadata["schema"] != 1
-        or metadata["protocol_version"] != 1
+        or type(metadata["protocol_version"]) is not int
+        or metadata["protocol_version"] not in PROTOCOL_VERSIONS
         or metadata["id"] != integration_id
         or not isinstance(metadata["tier"], str)
         or not isinstance(metadata["synthetic"], bool)
@@ -272,7 +277,10 @@ def validate_integration(source: Path, integration_id: str, pin: dict) -> dict:
     metadata["sdk_commit"] = revisions.pop()
     manifest = load_json(manifest_path)
     if (
-        manifest.get("protocol_version") != 1
+        manifest.get("protocol_version") != metadata["protocol_version"]
+        # The core refuses a manifest whose minimum core protocol differs from
+        # its own protocol, and reads an absent minimum as 1.
+        or manifest.get("min_core_protocol_version", 1) != metadata["protocol_version"]
         or manifest.get("id") != integration_id
         or not isinstance(manifest.get("version"), str)
         or not manifest["version"]
