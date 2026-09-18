@@ -56,7 +56,7 @@ docker run --rm --platform linux/arm/v7 \
         "$confd" integrations --root "$store" --keys-dir /keys install-sideload "$package"
         "$confd" integrations --root "$store" list | grep -Fx "denon $version"
         mkdir -p /tmp/denon-home/connections/denon-test
-        printf "%s\n" "{\"connections\":[{\"id\":\"denon-test\",\"provider\":{\"kind\":\"plugin\",\"id\":\"denon\"}}]}" \
+        printf "%s\n" "{\"schema_version\":1,\"connections\":[{\"id\":\"denon-test\",\"name\":\"Denon test\",\"provider\":{\"kind\":\"plugin\",\"id\":\"denon\",\"label\":\"Denon AVR\"}}]}" \
             >/tmp/denon-home/config.json
         printf "%s\n" "{\"host\":\"127.0.0.1\",\"port\":23}" \
             >/tmp/denon-home/connections/denon-test/plugin-connection.json
