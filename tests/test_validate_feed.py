@@ -250,6 +250,31 @@ couch-sdk = {{ git = "{LEGACY_CORE}", rev = "{revision}" }}
                 with self.assertRaisesRegex(feed.InvalidFeed, "must pin the Couch repository"):
                     self.validate(self.write_sources(core=repository))
 
+    def test_a_protocol_v2_package_is_admitted_when_both_files_agree(self):
+        v2 = {"protocol_version": 2, "min_core_protocol_version": 2}
+        selected = self.validate(self.write_sources(
+            metadata_changes={"protocol_version": 2}, manifest_changes=v2))
+        self.assertEqual(selected["denon"]["manifest_data"]["protocol_version"], 2)
+
+    def test_protocol_versions_must_be_known_and_agree(self):
+        for metadata, manifest, message in (
+            ({"protocol_version": 3}, {"protocol_version": 3, "min_core_protocol_version": 3}, "source metadata is invalid"),
+            ({"protocol_version": 0}, {"protocol_version": 0}, "source metadata is invalid"),
+            ({"protocol_version": True}, {}, "source metadata is invalid"),
+            ({"protocol_version": "2"}, {"protocol_version": 2, "min_core_protocol_version": 2}, "source metadata is invalid"),
+            # integration.json and plugin.json disagree, either way round.
+            ({"protocol_version": 2}, {}, "plugin manifest does not match"),
+            ({}, {"protocol_version": 2, "min_core_protocol_version": 2}, "plugin manifest does not match"),
+            # A v2 manifest that a v1 core would wrongly be allowed to load.
+            ({"protocol_version": 2}, {"protocol_version": 2}, "plugin manifest does not match"),
+            ({"protocol_version": 2}, {"protocol_version": 2, "min_core_protocol_version": 1}, "plugin manifest does not match"),
+            ({}, {"min_core_protocol_version": 2}, "plugin manifest does not match"),
+        ):
+            with self.subTest(metadata=metadata, manifest=manifest):
+                with self.assertRaisesRegex(feed.InvalidFeed, message):
+                    self.validate(self.write_sources(
+                        metadata_changes=metadata, manifest_changes=manifest))
+
     def test_manifest_identity_and_paths_are_enforced(self):
         with self.assertRaisesRegex(feed.InvalidFeed, "plugin manifest does not match"):
             self.validate(self.write_sources(manifest_changes={"id": "other"}))
