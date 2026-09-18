@@ -1,6 +1,14 @@
 name: Publish signed feed
 
 on:
+  # Publish by itself once a merge to main has passed admission. This event
+  # always runs this file as it is on the default branch, never a pull
+  # request's copy of it.
+  workflow_run:
+    workflows: [Feed admission]
+    types: [completed]
+    branches: [main]
+  # The manual route stays for republishing a main commit by hand.
   workflow_dispatch:
     inputs:
       admission_run_id:
@@ -19,13 +27,58 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  decide:
+    # No environment and no secrets: only decides whether there is anything to
+    # sign. A merge that touches none of the published inputs (a README, a
+    # test, the admission workflow) must not re-sign the indexes or cut a feed
+    # release. A manual run always publishes.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          publish=true
+          if [ "$MANUAL" != true ]; then
+            last=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+              --json tagName,isDraft,publishedAt \
+              --jq 'map(select(.isDraft == false and (.tagName | startswith("feed-")))) | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
+            last=${last#feed-}
+            # Everything scripts/publish.sh and the payload build read from
+            # this repository. An unknown or unrelated last commit publishes.
+            if [ -n "$last" ] && git merge-base --is-ancestor "$last" HEAD 2>/dev/null &&
+               git diff --quiet "$last" HEAD -- source-pin.json feed-policy.json feed keys \
+                 scripts/publish.sh scripts/build_artifact.sh scripts/checkout_sources.sh; then
+              publish=false
+            fi
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish"
+
   sign:
-    # workflow_dispatch permits branch selection. Never expose the protected
-    # signing environment to an alternate ref, including a pull request ref.
-    if: github.ref == 'refs/heads/main'
+    needs: decide
+    # Never expose the protected signing environment to an alternate ref,
+    # including a pull request ref: workflow_dispatch permits branch selection,
+    # and decide has already required main for both events.
+    if: github.ref == 'refs/heads/main' && needs.decide.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     environment: package-signing
+    env:
+      ADMISSION_RUN_ID: ${{ inputs.admission_run_id || github.event.workflow_run.id }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -33,7 +86,7 @@ jobs:
       - name: Require a successful admission run for this exact main commit
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ inputs.admission_run_id }}
+          RUN_ID: ${{ env.ADMISSION_RUN_ID }}
         run: |
           case "$RUN_ID" in *[!0-9]*|'') exit 1;; esac
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/admission-run.json"
@@ -49,7 +102,7 @@ jobs:
         with:
           name: preview-armv7-payload
           path: ${{ runner.temp }}/payload
-          run-id: ${{ inputs.admission_run_id }}
+          run-id: ${{ env.ADMISSION_RUN_ID }}
           github-token: ${{ github.token }}
       - name: Check out every exact approved source pin
         working-directory: feed

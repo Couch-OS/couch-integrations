@@ -152,12 +152,25 @@ reviewed source graph, distribution policy, and publishing workflow.
 
 ## Publish an admitted revision
 
-After merging a reviewed feed change and its main-branch admission run passes:
+Publication is automatic. When a reviewed feed change is merged and its
+main-branch `Feed admission` run succeeds, `publish.yml` starts by itself, takes
+the payload that run built, signs the indexes and deploys the site. A merge that
+changes none of the published inputs (`source-pin.json`, `feed-policy.json`,
+`feed/`, `keys/` and the build and publish scripts) is skipped, so a README or
+test change does not re-sign anything. The automatic run uses this workflow as
+it is on `main`, never a pull request's copy, and still refuses unless the
+admission run passed for exactly the commit being published.
+
+To republish a `main` commit by hand:
 
 ```sh
 gh workflow run publish.yml --repo Couch-OS/couch-integrations \
   --ref main -f admission_run_id=SUCCESSFUL_MAIN_ADMISSION_RUN_ID
 ```
+
+Merging to `main` is therefore the last human decision before the signing key is
+used. For one more, add required reviewers to the `package-signing` environment
+(Settings → Environments): each signing job then waits for an approval click.
 
 Require `admission` from GitHub Actions (app ID `15368`) in branch protection,
 with up-to-date branches and administrators included. Signing and Pages
