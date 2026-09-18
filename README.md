@@ -13,15 +13,15 @@ validates each repository's `integration.json`, runs its locked test suite,
 builds ARMv7 payloads, and exercises the native package path. Changing any pin
 therefore requires the same reviewable evidence as a package change.
 
-The Couch repositories are moving from `dangerouslaser` to the
-[Couch-OS](https://github.com/Couch-OS) organization, and a pin may name either
-owner with exactly that casing. Denon is pinned at
+The Couch repositories moved from `dangerouslaser` to the
+[Couch-OS](https://github.com/Couch-OS) organization in September 2026, and a
+pin may name either owner with exactly that casing. Denon is pinned at
 [`Couch-OS/couch-integration-denon`](https://github.com/Couch-OS/couch-integration-denon),
 and the Couch tooling pin now names
 [`Couch-OS/couch`](https://github.com/Couch-OS/couch) at the same commit. GitHub
 redirects a transferred Git URL only until a repository exists again at the old
-name, so a pin must not rely on that redirect. This feed repository itself has
-not moved; its own workflow and Pages URLs still name `dangerouslaser`.
+name, so a pin must not rely on that redirect. This feed repository moved on
+2026-09-18.
 
 ## Channels
 
@@ -39,11 +39,15 @@ https://packages.couch-os.dev/preview
 https://packages.couch-os.dev/stable   # intentionally empty
 ```
 
-`packages.couch-os.dev` goes live once its DNS record and this repository's
-GitHub Pages custom domain are configured. Until then the same feed is served at
-`https://dangerouslaser.github.io/couch-integrations/{preview,stable}`, which
-redirects to `https://packages.couch-os.dev` afterwards. The published site uses
-only relative links, so it works from either hostname.
+`packages.couch-os.dev` is this repository's GitHub Pages custom domain. Before
+the move the same feed was served at
+`https://dangerouslaser.github.io/couch-integrations/{preview,stable}`; that
+address no longer exists, because a Pages address follows its owner and is not
+forwarded. Couch fetches indexes with redirects off, so runtimes that know only
+that address (up to `v0.1.0-alpha.20260918.175.dev`) cannot browse, install or
+update packages until they update; their installed integrations keep working,
+and the system updater is unaffected. Later runtimes try
+`packages.couch-os.dev` first. The published site uses only relative links.
 
 The Couch installer appends `armv7` when it fetches `APKINDEX.tar.gz`.
 
@@ -151,7 +155,7 @@ reviewed source graph, distribution policy, and publishing workflow.
 After merging a reviewed feed change and its main-branch admission run passes:
 
 ```sh
-gh workflow run publish.yml --repo dangerouslaser/couch-integrations \
+gh workflow run publish.yml --repo Couch-OS/couch-integrations \
   --ref main -f admission_run_id=SUCCESSFUL_MAIN_ADMISSION_RUN_ID
 ```
 
