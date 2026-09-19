@@ -8,6 +8,10 @@
     "denon": {
       "repository": "https://github.com/Couch-OS/couch-integration-denon.git",
       "commit": "8d3081353188916d575dccd36582b460b9b190c6"
+    },
+    "sonos": {
+      "repository": "https://github.com/Couch-OS/couch-integration-sonos.git",
+      "commit": "fb763ff240dbf47e8bd5c03dfed73f9a0f0ab40f"
     }
   }
 }
