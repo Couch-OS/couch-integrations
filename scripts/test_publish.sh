@@ -10,6 +10,10 @@ payload=$(CDPATH= cd -- "$3" && pwd -P)
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 1; }
 command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 1; }
 
+# A pull request payload has no build secrets. publish.sh accepts one only in
+# review mode, and only because the key below is not the production key.
+export COUCH_FEED_REVIEW_PAYLOAD=1
+
 work=$(mktemp -d "${TMPDIR:-/tmp}/couch-feed-publish.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 test_feed="$work/feed"

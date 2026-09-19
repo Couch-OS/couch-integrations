@@ -12,8 +12,29 @@ payload=$(CDPATH= cd -- "$4" && pwd -P)
 case "$5" in /*) out=$5 ;; *) out=$PWD/$5 ;; esac
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 
+# A pull request payload is built without build secrets (build-secrets.json),
+# so its allowlisted integrations carry their placeholder. test_publish.sh may
+# sign one with a disposable key by setting COUCH_FEED_REVIEW_PAYLOAD=1. The
+# production key must never do so: this is its DER SHA-256, and a checkout that
+# still trusts it refuses review mode outright. tests/test_build_secrets.py
+# keeps the value in step with keys/couch-integrations.rsa.pub.
+production_key_sha256=2e6f19b020bd150147e2f690a2e8e7f589fe4b7dfa28ba8aa1f8bacefe51d205
+review=
+case "${COUCH_FEED_REVIEW_PAYLOAD:-0}" in
+    0) ;;
+    1)
+        trusted=$(openssl pkey -pubin -in "$root/keys/couch-integrations.rsa.pub" -outform DER | openssl dgst -sha256 -r)
+        [ "${trusted%% *}" != "$production_key_sha256" ] || {
+            echo "review payloads can be signed only with a disposable key, never the production key" >&2
+            exit 1
+        }
+        review=--review
+        ;;
+    *) echo "COUCH_FEED_REVIEW_PAYLOAD must be 0 or 1" >&2; exit 64 ;;
+esac
+
 python3 "$root/scripts/validate_feed.py" --sources "$sources"
-python3 "$root/scripts/validate_payload.py" "$root" "$sources" "$payload"
+python3 "$root/scripts/validate_payload.py" $review "$root" "$sources" "$payload"
 [ -f "$key" ] || { echo "private signing key is missing" >&2; exit 1; }
 [ -d "$previous" ] && [ ! -e "$out" ] || { echo "previous site or output is invalid" >&2; exit 1; }
 

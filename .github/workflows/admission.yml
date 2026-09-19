@@ -75,6 +75,15 @@ jobs:
     needs: policy
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # build-secrets.json names the only build-time secrets, and they live in the
+    # package-build environment, which admits the main branch alone. A pull
+    # request runs this job with no environment: every secret below is then
+    # empty and an allowlisted integration compiles its own placeholder. Only a
+    # main-branch payload is ever signed, and that build fails without them.
+    # Never add a cache to this job, and never reuse package-signing here.
+    environment: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && 'package-build' || '' }}
+    env:
+      COUCH_FEED_REQUIRE_BUILD_SECRETS: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -88,9 +97,22 @@ jobs:
       - name: Install the pinned ARM C toolchain
         working-directory: sources/tooling
         run: tools/fetch-zig.sh
+      - name: Fetch locked dependencies of integrations that receive a build secret
+        working-directory: feed
+        run: scripts/build_with_secrets.sh fetch ../sources
+      - name: Compile integrations that receive a build secret, offline
+        working-directory: feed
+        env:
+          COUCH_SONOS_BUILT_IN_API_KEY: ${{ secrets.COUCH_SONOS_BUILT_IN_API_KEY }}
+        run: scripts/build_with_secrets.sh compile ../sources "$RUNNER_TEMP/secret-stage"
       - name: Build unsigned, reviewable ARM payloads
         working-directory: feed
-        run: scripts/build_artifact.sh ../sources "$RUNNER_TEMP/payload"
+        run: scripts/build_artifact.sh ../sources "$RUNNER_TEMP/payload" "$RUNNER_TEMP/secret-stage"
+      - name: Require every build secret to stay inside its own binary
+        working-directory: feed
+        env:
+          COUCH_SONOS_BUILT_IN_API_KEY: ${{ secrets.COUCH_SONOS_BUILT_IN_API_KEY }}
+        run: python3 scripts/build_secret_guard.py payload "$RUNNER_TEMP/payload"
       - uses: actions/upload-artifact@v4
         with:
           name: preview-armv7-payload

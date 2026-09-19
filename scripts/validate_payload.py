@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Validate an unsigned multi-source payload before the protected signer."""
+"""Validate an unsigned multi-source payload before the protected signer.
+
+An integration listed in build-secrets.json is publishable only when its
+receipt records every one of its build secrets. --review also accepts a receipt
+that records none: a pull request build, which has no secrets and compiled the
+integration's placeholder. The signing job never passes --review.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -27,12 +33,19 @@ def load(path: Path) -> dict:
     return value
 
 
-if len(sys.argv) != 4:
-    raise SystemExit(f"Usage: {sys.argv[0]} FEED_ROOT SOURCES_DIR PAYLOAD_DIR")
+arguments = sys.argv[1:]
+review = arguments[:1] == ["--review"]
+if review:
+    del arguments[0]
+if len(arguments) != 3:
+    raise SystemExit(f"Usage: {sys.argv[0]} [--review] FEED_ROOT SOURCES_DIR PAYLOAD_DIR")
 
-feed, sources, payload = map(Path, sys.argv[1:])
+feed, sources, payload = map(Path, arguments)
 pins = load(feed / "source-pin.json")
 policy = load(feed / "feed-policy.json")
+build_secrets = load(feed / "build-secrets.json").get("integrations")
+if not isinstance(build_secrets, dict):
+    fail("build-secrets.json must map integration IDs to secret names")
 if load(payload / "SOURCE_PINS.json") != pins:
     fail("artifact source pins do not match the reviewed feed pins")
 
@@ -70,6 +83,15 @@ for integration_id in policy["channels"]["preview"]["ids"]:
         "binary_sha256": digest(binary),
         "manifest_sha256": digest(manifest),
     }
+    if integration_id in build_secrets:
+        required = build_secrets[integration_id]
+        recorded = record.get("built_with_secrets")
+        if recorded != required and not (review and recorded == []):
+            fail(
+                f"{integration_id} was not built with its required build secrets "
+                f"({', '.join(required)}); only a main-branch admission build is publishable"
+            )
+        expected["built_with_secrets"] = recorded
     if artifact_manifest != source_manifest or record != expected:
         fail(f"{integration_id} manifest or provenance does not match its pinned source")
 
