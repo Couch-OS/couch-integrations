@@ -94,6 +94,26 @@ docker run --rm --platform linux/arm/v7 \
         test ! -e /tmp/repository-store/slots/denon
         test -f /tmp/repository-store/state/denon
         test "$(cat /tmp/repository-store/state/denon)" = "{\"active\":null,\"previous\":null}"
+
+        # Every other package the channel publishes gets the same journey
+        # through the real host: found in the signed repository, installed,
+        # listed at its version, removed without a trace of its slot.
+        for package in /site/preview/armv7/couch-integration-*.apk; do
+            name=${package##*/couch-integration-}
+            name=${name%-r0.apk}
+            id=${name%-*}
+            version=${name##*-}
+            [ "$id" != denon ] || continue
+            "$confd" integrations --root "/tmp/$id-store" --keys-dir /keys \
+                install-repository "couch-integration-$id" --repository http://127.0.0.1:18080
+            "$confd" integrations --root "/tmp/$id-store" list | grep -Fx "$id $version"
+            test -x "/tmp/$id-store/slots/$id/$version/$(sed -n "s/.*\"executable\": *\"\([^\"]*\)\".*/\1/p" "/tmp/$id-store/slots/$id/$version/manifest.json" | head -n 1)" \
+                || { echo "$id $version: installed slot has no executable" >&2; ls -R "/tmp/$id-store/slots/$id" >&2; exit 1; }
+            "$confd" integrations --root "/tmp/$id-store" remove "$id"
+            test -z "$("$confd" integrations --root "/tmp/$id-store" list)"
+            test ! -e "/tmp/$id-store/slots/$id"
+            echo "install smoke passed: $id $version"
+        done
     '
 
 # A same-version run restores the published receipt and package rather than
