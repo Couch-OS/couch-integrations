@@ -60,8 +60,9 @@ jobs:
             # Everything scripts/publish.sh and the payload build read from
             # this repository. An unknown or unrelated last commit publishes.
             if [ -n "$last" ] && git merge-base --is-ancestor "$last" HEAD 2>/dev/null &&
-               git diff --quiet "$last" HEAD -- source-pin.json feed-policy.json feed keys \
-                 scripts/publish.sh scripts/build_artifact.sh scripts/checkout_sources.sh; then
+               git diff --quiet "$last" HEAD -- source-pin.json feed-policy.json build-secrets.json feed keys \
+                 scripts/publish.sh scripts/build_artifact.sh scripts/build_with_secrets.sh \
+                 scripts/build_secret_guard.py scripts/checkout_sources.sh; then
               publish=false
             fi
           fi

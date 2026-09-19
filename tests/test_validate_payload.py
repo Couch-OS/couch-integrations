@@ -54,6 +54,7 @@ class PayloadValidationTests(unittest.TestCase):
             self.feed / "feed-policy.json",
             {"channels": {"preview": {"ids": [self.integration_id]}}},
         )
+        self.write_json(self.feed / "build-secrets.json", {"schema": 1, "integrations": {}})
         self.write_json(
             self.source / "integration.json",
             {
@@ -109,9 +110,9 @@ couch-sdk = {{ git = "https://github.com/dangerouslaser/couch.git", rev = "{self
         record.update(changes)
         self.write_json(self.provenance, record)
 
-    def validate(self):
+    def validate(self, *flags):
         return subprocess.run(
-            [sys.executable, str(SCRIPT), str(self.feed), str(self.sources), str(self.payload)],
+            [sys.executable, str(SCRIPT), *flags, str(self.feed), str(self.sources), str(self.payload)],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -158,6 +159,42 @@ couch-sdk = {{ git = "https://github.com/dangerouslaser/couch.git", rev = "{self
     def test_altered_source_provenance_is_rejected(self):
         self.write_provenance(source_commit="c" * 40)
         self.assert_rejected(self.validate())
+
+    def allow_build_secret(self, *names):
+        self.write_json(self.feed / "build-secrets.json", {"schema": 1, "integrations": {self.integration_id: list(names)}})
+
+    def test_payload_without_the_build_secret_allowlist_is_rejected(self):
+        (self.feed / "build-secrets.json").unlink()
+        self.assert_rejected(self.validate(), "cannot read")
+        self.assert_rejected(self.validate("--review"), "cannot read")
+
+    def test_allowlisted_integration_is_publishable_only_with_every_secret(self):
+        self.allow_build_secret("COUCH_DENON_A", "COUCH_DENON_B")
+        self.write_provenance(built_with_secrets=["COUCH_DENON_A", "COUCH_DENON_B"])
+        self.assertEqual(self.validate().returncode, 0)
+        self.assertEqual(self.validate("--review").returncode, 0)
+        for recorded in ([], ["COUCH_DENON_A"], ["COUCH_DENON_B", "COUCH_DENON_A"], ["COUCH_OTHER"], None, "COUCH_DENON_A"):
+            with self.subTest(recorded=recorded):
+                self.write_provenance(built_with_secrets=recorded)
+                self.assert_rejected(self.validate(), "was not built with its required build secrets")
+        self.write_provenance()
+        self.assert_rejected(self.validate(), "was not built with its required build secrets")
+
+    def test_placeholder_build_is_accepted_for_review_only(self):
+        self.allow_build_secret("COUCH_DENON_A")
+        self.write_provenance(built_with_secrets=[])
+        self.assertEqual(self.validate("--review").returncode, 0)
+        self.assert_rejected(self.validate(), "only a main-branch admission build is publishable")
+        # Review mode is not a wildcard: a partial or foreign record still fails.
+        self.write_provenance(built_with_secrets=["COUCH_OTHER"])
+        self.assert_rejected(self.validate("--review"), "was not built with its required build secrets")
+        self.write_provenance()
+        self.assert_rejected(self.validate("--review"), "was not built with its required build secrets")
+
+    def test_unlisted_integration_cannot_claim_a_build_secret(self):
+        self.write_provenance(built_with_secrets=[])
+        self.assert_rejected(self.validate())
+        self.assert_rejected(self.validate("--review"))
 
     def test_unselected_payload_directory_is_rejected(self):
         (self.payload / "unexpected").mkdir()

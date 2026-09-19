@@ -31,6 +31,10 @@ RECEIPT_FIELDS = frozenset({
     "sdk_commit", "tooling_repository", "tooling_commit", "id", "version",
     "binary", "binary_sha256", "manifest_sha256",
 })
+# An integration named in build-secrets.json carries one more receipt field: the
+# names (never the values) of the build secrets its binary was compiled with.
+# Every other receipt keeps exactly the twelve fields above.
+RECEIPT_SECRETS_FIELD = "built_with_secrets"
 RECEIPT_COMMITS = ("source_commit", "sdk_commit", "tooling_commit")
 RECEIPT_REPOSITORIES = ("source_repository", "sdk_repository", "tooling_repository")
 CHANNELS = {"preview", "stable"}
@@ -46,6 +50,9 @@ REQUIRED_ADMISSION_CALLS = {
     "spike": "testing::spike(",
     "concurrent_package_startup_is_offline_and_race_free": "testing::Package::new(",
 }
+
+
+BUILD_SECRET_NAME = re.compile(r"COUCH(?:_[A-Z0-9]+)+")
 
 
 class InvalidFeed(ValueError):
@@ -143,25 +150,72 @@ def policy() -> dict:
     return value
 
 
+def build_secret_prefix(integration_id: str) -> str:
+    """The only environment namespace an integration's build secrets may use."""
+    return "COUCH_" + re.sub(r"[^A-Z0-9]", "_", integration_id.upper()) + "_"
+
+
+def build_secrets() -> dict[str, list[str]]:
+    """The reviewed allowlist of build-time secrets: integration ID to the
+    environment variable names its compile step may receive.
+
+    Only this file grants a secret. An integration repository cannot ask for
+    one, and a name must sit in its own integration's COUCH_<ID>_ namespace, so
+    it can never shadow a toolchain variable or another integration's secret.
+    """
+    value = load_json(ROOT / "build-secrets.json")
+    exact_keys(value, {"schema", "integrations"}, "build-secrets.json")
+    allowed = value["integrations"]
+    if value["schema"] != 1 or not isinstance(allowed, dict):
+        raise InvalidFeed("build-secrets.json must map integration IDs to secret names")
+    prefixes: set[str] = set()
+    for integration_id, names in allowed.items():
+        if not safe_component(integration_id):
+            raise InvalidFeed("build-secrets.json has an invalid integration ID")
+        prefix = build_secret_prefix(integration_id)
+        if prefix in prefixes:
+            raise InvalidFeed(f"build-secrets.json IDs collide in the {prefix} namespace")
+        prefixes.add(prefix)
+        if (
+            not isinstance(names, list)
+            or not names
+            or not all(isinstance(name, str) for name in names)
+            or names != sorted(set(names))
+        ):
+            raise InvalidFeed(f"{integration_id} build secrets must be a sorted list of unique names")
+        for name in names:
+            if not BUILD_SECRET_NAME.fullmatch(name) or not name.startswith(prefix):
+                raise InvalidFeed(f"{integration_id} build secret {name!r} must be named {prefix}...")
+    return allowed
+
+
 def repository_name(repository: object) -> str | None:
     """Return the repository name of an allowed-owner GitHub URL, else None."""
     match = REPOSITORY.fullmatch(repository) if isinstance(repository, str) else None
     return match["name"] if match else None
 
 
-def validate_retained_receipt(approved: object, existing: object) -> None:
+def validate_retained_receipt(
+    approved: object, existing: object, allowed_secrets: dict[str, list[str]] | None = None,
+) -> None:
     """Allow reuse of a published APK only when its original receipt describes
     the approved payload's exact bytes.
 
     Two historical differences are tolerated: a pin commit may have advanced
     without changing the package, and a repository may have moved between the
-    allowed owners under the same name. Every other field must be identical.
+    allowed owners under the same name. Every other field must be identical,
+    including the names of the build secrets an allowlisted integration was
+    compiled with.
     """
+    fields = RECEIPT_FIELDS
+    if isinstance(approved, dict) and isinstance(approved.get("id"), str) \
+            and approved["id"] in (allowed_secrets or {}):
+        fields = RECEIPT_FIELDS | {RECEIPT_SECRETS_FIELD}
     if (
         not isinstance(approved, dict)
         or not isinstance(existing, dict)
-        or set(approved) != RECEIPT_FIELDS
-        or set(existing) != RECEIPT_FIELDS
+        or set(approved) != fields
+        or set(existing) != fields
     ):
         raise InvalidFeed("existing APK provenance receipt has an invalid shape")
     for field in RECEIPT_COMMITS:
@@ -173,7 +227,7 @@ def validate_retained_receipt(approved: object, existing: object) -> None:
             raise InvalidFeed(f"existing APK provenance receipt has an invalid {field}")
         if name != repository_name(approved[field]):
             raise InvalidFeed(f"existing APK {field} names a different repository than the approved payload")
-    identity = RECEIPT_FIELDS.difference(RECEIPT_COMMITS, RECEIPT_REPOSITORIES)
+    identity = fields.difference(RECEIPT_COMMITS, RECEIPT_REPOSITORIES)
     if any(existing[field] != approved[field] for field in identity):
         raise InvalidFeed("existing APK immutable provenance differs from approved payload")
 
@@ -326,6 +380,10 @@ def main() -> int:
     parser.add_argument("--emit-pins", action="store_true", help="emit validated checkout pins as TSV")
     parser.add_argument("--emit-selected", action="store_true", help="emit selected integration metadata as TSV")
     parser.add_argument(
+        "--emit-build-secrets", action="store_true",
+        help="emit every allowlisted build secret name, and whether its integration is selected, as TSV",
+    )
+    parser.add_argument(
         "--retained-receipt", nargs=2, type=Path, metavar=("APPROVED", "EXISTING"),
         help="check that a published APK receipt may be reused for an approved payload receipt",
     )
@@ -333,9 +391,10 @@ def main() -> int:
     try:
         pins = source_pins()
         selected_policy = policy()
+        allowed_secrets = build_secrets()
         validate_key()
         if args.retained_receipt:
-            validate_retained_receipt(*map(load_json, args.retained_receipt))
+            validate_retained_receipt(*map(load_json, args.retained_receipt), allowed_secrets)
             return 0
         if args.emit_pins:
             print("\t".join(("tooling", pins["tooling"]["repository"], pins["tooling"]["commit"])))
@@ -347,6 +406,17 @@ def main() -> int:
         if args.sources is None:
             raise InvalidFeed("--sources is required unless --pins-only is used")
         selected = validate_sources(args.sources.resolve(), pins, selected_policy)
+        if args.emit_build_secrets:
+            # Every allowlisted name is listed so the build can scrub all of
+            # them; only a preview-selected integration is ever compiled.
+            published = selected_policy["channels"]["preview"]["ids"]
+            for integration_id, names in sorted(allowed_secrets.items()):
+                for name in names:
+                    if integration_id in published:
+                        print("\t".join((integration_id, name, "selected", selected[integration_id]["binary"])))
+                    else:
+                        print("\t".join((integration_id, name, "unselected", "-")))
+            return 0
         if args.emit_selected:
             for integration_id in selected_policy["channels"]["preview"]["ids"]:
                 item = selected[integration_id]

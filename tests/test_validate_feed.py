@@ -31,6 +31,7 @@ class FeedPolicyTests(unittest.TestCase):
         (self.root / "keys").mkdir()
         self.write_pins()
         self.write_policy([])
+        self.write_json(self.root / "build-secrets.json", {"schema": 1, "integrations": {}})
 
     def tearDown(self):
         feed.ROOT = self.old_root
