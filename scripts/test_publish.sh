@@ -26,8 +26,97 @@ rm -rf "$test_feed/.git" "$test_feed/scripts/__pycache__" "$test_feed/tests/__py
 openssl genrsa -out "$key" 4096 >/dev/null 2>&1
 openssl pkey -in "$key" -pubout >"$test_feed/keys/couch-integrations.rsa.pub"
 
+# Every publication below happens at a stated time, so feed.json is the same
+# bytes on every run and the sequence rule can be tested on purpose.
+first_clock=1790000000
+publish_at() {
+    clock=$1
+    shift
+    COUCH_FEED_NOW=$clock "$test_feed/scripts/publish.sh" "$@"
+}
+
+# Feed metadata is checked the way anyone can check it: openssl for the
+# signature, then plain hashing of the files beside it. feed_metadata.py, which
+# wrote it, takes no part.
+check_feed_metadata() {
+    for channel in preview stable; do
+        openssl dgst -sha256 -verify "$test_feed/keys/couch-integrations.rsa.pub" \
+            -signature "$1/$channel/armv7/feed.json.sig" "$1/$channel/armv7/feed.json" >/dev/null
+    done
+    python3 - "$1" "$2" "$payload" <<'PY'
+import datetime, hashlib, json, sys, tarfile
+from pathlib import Path
+
+site, clock, payload = Path(sys.argv[1]), int(sys.argv[2]), Path(sys.argv[3])
+stamp = lambda seconds: datetime.datetime.fromtimestamp(
+    seconds, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+# Protocol numbers of every version line this feed has published so far.
+known = {("denon", "0.1"): (1, 1), ("denon", "0.2"): (2, 2), ("sonos", "0.1"): (1, 1), ("kodi", "0.1"): (1, 1)}
+
+for channel in ("preview", "stable"):
+    directory = site / channel / "armv7"
+    raw = (directory / "feed.json").read_bytes()
+    feed = json.loads(raw)
+    assert raw.endswith(b"}\n") and len(raw) <= 256 * 1024, "feed.json framing"
+    assert (directory / "feed.json.sig").stat().st_size <= 1024, "signature size"
+    assert list(feed) == ["schema", "channel", "sequence", "issued", "expires", "index", "packages"], list(feed)
+    assert (feed["schema"], feed["channel"], feed["sequence"]) == (1, channel, clock), feed
+    assert (feed["issued"], feed["expires"]) == (stamp(clock), stamp(clock + 30 * 86400)), feed
+    index = directory / "APKINDEX.tar.gz"
+    assert feed["index"] == {"path": "APKINDEX.tar.gz", "size": index.stat().st_size, "sha256": digest(index)}, feed["index"]
+    with tarfile.open(index, "r:gz") as archive:
+        records = archive.extractfile("APKINDEX").read().decode().split("\n\n")
+    indexed = []
+    for record in filter(None, records):
+        fields = dict(line.split(":", 1) for line in record.splitlines())
+        indexed.append(f"{fields['P']}-{fields['V']}.apk")
+    listed = [item["apk"] for item in feed["packages"]]
+    assert sorted(listed) == sorted(indexed) == sorted(path.name for path in directory.glob("*.apk")), (listed, indexed)
+    order = [(item["id"], [int(part) if part.isdigit() else -1 for part in item["version"].split(".")])
+             for item in feed["packages"]]
+    assert order == sorted(order), "packages are sorted by id, then version"
+    for item in feed["packages"]:
+        assert list(item) == ["id", "version", "apk", "size", "sha256", "protocol_version", "min_core_protocol_version"], item
+        apk = directory / item["apk"]
+        assert item["apk"] == f"couch-integration-{item['id']}-{item['version']}-r0.apk", item
+        assert (item["size"], item["sha256"]) == (apk.stat().st_size, digest(apk)), item
+        numbers = (item["protocol_version"], item["min_core_protocol_version"])
+        expected = known.get((item["id"], item["version"].rsplit(".", 1)[0]))
+        assert expected in (None, numbers), (item, expected)
+        manifest = json.loads((payload / item["id"] / "manifest.json").read_text(encoding="utf-8"))
+        if manifest["version"] == item["version"]:
+            assert numbers == (manifest["protocol_version"], manifest.get("min_core_protocol_version", 1)), item
+        else:
+            assert expected is not None, f"no independent protocol numbers for {item['apk']}"
+    if channel == "stable":
+        assert feed["packages"] == [], feed["packages"]
+    else:
+        assert {item["id"] for item in feed["packages"]} == {path.name for path in payload.iterdir() if path.is_dir()}
+PY
+}
+
 mkdir "$work/empty-history"
-"$test_feed/scripts/publish.sh" "$sources" "$key" "$work/empty-history" "$payload" "$work/first"
+publish_at "$first_clock" "$sources" "$key" "$work/empty-history" "$payload" "$work/first"
+check_feed_metadata "$work/first" "$first_clock"
+
+# One changed byte of feed.json must fail the same openssl check.
+sed 's/"sequence": [0-9]*/"sequence": 1/' "$work/first/preview/armv7/feed.json" >"$work/tampered-feed.json"
+if cmp -s "$work/tampered-feed.json" "$work/first/preview/armv7/feed.json"; then
+    echo "tamper fixture did not change feed.json" >&2
+    exit 1
+fi
+if openssl dgst -sha256 -verify "$test_feed/keys/couch-integrations.rsa.pub" \
+    -signature "$work/first/preview/armv7/feed.json.sig" "$work/tampered-feed.json" >/dev/null 2>&1; then
+    echo "a tampered feed.json still verified" >&2
+    exit 1
+fi
+# Nor may one channel's signature vouch for the other channel's metadata.
+if openssl dgst -sha256 -verify "$test_feed/keys/couch-integrations.rsa.pub" \
+    -signature "$work/first/stable/armv7/feed.json.sig" "$work/first/preview/armv7/feed.json" >/dev/null 2>&1; then
+    echo "the stable signature verified the preview feed.json" >&2
+    exit 1
+fi
 
 package=$(find "$work/first/preview/armv7" -maxdepth 1 -type f -name 'couch-integration-denon-*.apk' -print -quit)
 [ -n "$package" ] || { echo "first publish emitted no Denon APK" >&2; exit 1; }
@@ -116,9 +205,64 @@ docker run --rm --platform linux/arm/v7 \
         done
     '
 
-# A same-version run restores the published receipt and package rather than
-# creating a timestamp-dependent replacement artifact.
-"$test_feed/scripts/publish.sh" "$sources" "$key" "$work/first" "$payload" "$work/second"
+# A publication that does not move the sequence forward is refused before it
+# writes anything: a remote would refuse that feed.
+for clock in "$first_clock" "$((first_clock - 1))"; do
+    if publish_at "$clock" "$sources" "$key" "$work/first" "$payload" "$work/not-later"; then
+        echo "publisher accepted sequence $clock after $first_clock" >&2
+        exit 1
+    fi
+    test ! -e "$work/not-later"
+done
+
+# Only feed.json and its signature may differ between two sites.
+same_but_for_metadata() {
+    (cd "$1" && find . -type f | sort) >"$work/files-before"
+    (cd "$2" && find . -type f | sort) >"$work/files-after"
+    cmp "$work/files-before" "$work/files-after"
+    while read -r file; do
+        case "$file" in
+            */armv7/feed.json|*/armv7/feed.json.sig)
+                if cmp -s "$1/$file" "$2/$file"; then
+                    echo "$file was not renewed" >&2
+                    exit 1
+                fi ;;
+            *)
+                cmp "$1/$file" "$2/$file" ;;
+        esac
+    done <"$work/files-before"
+}
+
+# A same-version run a week later restores the published receipt and package
+# rather than creating a timestamp-dependent replacement artifact. With nothing
+# added, both indexes are reused as well: only the metadata is renewed.
+second_clock=$((first_clock + 7 * 86400))
+publish_at "$second_clock" "$sources" "$key" "$work/first" "$payload" "$work/second"
+check_feed_metadata "$work/second" "$second_clock"
+same_but_for_metadata "$work/first" "$work/second"
+
+# The weekly re-signing takes no payload and no sources. It renews the metadata
+# of the newest published site and nothing else, under the same sequence rule.
+third_clock=$((second_clock + 7 * 86400))
+COUCH_FEED_NOW=$third_clock "$test_feed/scripts/resign.sh" "$key" "$work/second" "$work/resigned"
+check_feed_metadata "$work/resigned" "$third_clock"
+same_but_for_metadata "$work/second" "$work/resigned"
+if COUCH_FEED_NOW=$third_clock "$test_feed/scripts/resign.sh" "$key" "$work/resigned" "$work/resigned-again"; then
+    echo "re-signing accepted a sequence that did not move forward" >&2
+    exit 1
+fi
+# It signs only what the previous signed metadata vouches for.
+if COUCH_FEED_NOW=$third_clock "$test_feed/scripts/resign.sh" "$key" "$work/empty-history" "$work/resigned-nothing"; then
+    echo "re-signing accepted a site without signed metadata" >&2
+    exit 1
+fi
+cp -a "$work/second" "$work/swapped-package"
+printf x >>"$work/swapped-package/preview/armv7/$(basename "$package")"
+if COUCH_FEED_NOW=$third_clock "$test_feed/scripts/resign.sh" "$key" "$work/swapped-package" "$work/resigned-swapped"; then
+    echo "re-signing accepted a package its previous metadata does not describe" >&2
+    exit 1
+fi
+test ! -e "$work/resigned-again" && test ! -e "$work/resigned-nothing" && test ! -e "$work/resigned-swapped"
 second_package="$work/second/preview/armv7/$(basename "$package")"
 second_digest=$(sha256sum "$second_package")
 second_digest=${second_digest%% *}
@@ -140,7 +284,7 @@ record = json.loads(path.read_text(encoding="utf-8"))
 record["source_commit"] = sys.argv[2]
 path.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
-"$test_feed/scripts/publish.sh" "$sources" "$key" "$older_history" "$payload" "$work/third"
+publish_at "$((first_clock + 2))" "$sources" "$key" "$older_history" "$payload" "$work/third"
 third_package="$work/third/preview/armv7/$(basename "$package")"
 third_receipt="$work/third/preview/armv7/$(basename "${package%.apk}").provenance.json"
 third_digest=$(sha256sum "$third_package")
@@ -177,7 +321,7 @@ if cmp -s "$moved_receipt" "$work/first/preview/armv7/$(basename "$moved_receipt
     echo "owner-move fixture did not change the receipt" >&2
     exit 1
 fi
-"$test_feed/scripts/publish.sh" "$sources" "$key" "$moved_history" "$payload" "$work/owner-moved"
+publish_at "$((first_clock + 3))" "$sources" "$key" "$moved_history" "$payload" "$work/owner-moved"
 cmp -s "$package" "$work/owner-moved/preview/armv7/$(basename "$package")"
 cmp -s "$moved_receipt" "$work/owner-moved/preview/armv7/$(basename "$moved_receipt")"
 
@@ -186,7 +330,7 @@ cmp -s "$moved_receipt" "$work/owner-moved/preview/armv7/$(basename "$moved_rece
 renamed_history="$work/renamed-history"
 cp -a "$work/first" "$renamed_history"
 rewrite_receipt "$renamed_history/preview/armv7/$(basename "$moved_receipt")" renamed
-if "$test_feed/scripts/publish.sh" "$sources" "$key" "$renamed_history" "$payload" "$work/renamed"; then
+if publish_at "$((first_clock + 4))" "$sources" "$key" "$renamed_history" "$payload" "$work/renamed"; then
     echo "publisher reused an APK whose receipt names another repository" >&2
     exit 1
 fi
@@ -209,7 +353,7 @@ record = json.loads(path.read_text(encoding="utf-8"))
 record["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
 path.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
-if "$test_feed/scripts/publish.sh" "$sources" "$key" "$work/third" "$work/changed-payload" "$work/rejected"; then
+if publish_at "$((first_clock + 5))" "$sources" "$key" "$work/third" "$work/changed-payload" "$work/rejected"; then
     echo "publisher accepted changed payload at an existing version" >&2
     exit 1
 fi

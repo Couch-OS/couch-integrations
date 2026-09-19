@@ -72,6 +72,75 @@ integration-capable runtime before using the feed. Verify it against the
 fingerprint above, obtained through a trusted source. Never put the private PEM in this
 repository, an artifact, a pull-request workflow, or a package.
 
+## Feed metadata
+
+The Alpine index is signed, but it never expires and it has no order. Someone
+sitting between a remote and this feed could keep serving an old, validly signed
+index for ever, or swap in an older one than the remote has already seen, and so
+hide a fixed package. A remote also used to learn that a package needs a newer
+Couch only after downloading it.
+
+Each channel therefore publishes two more files beside its index:
+
+```text
+https://packages.couch-os.dev/preview/armv7/feed.json
+https://packages.couch-os.dev/preview/armv7/feed.json.sig
+https://packages.couch-os.dev/stable/armv7/feed.json
+https://packages.couch-os.dev/stable/armv7/feed.json.sig
+```
+
+`feed.json` says which channel it is for, when it was issued and when it
+expires, carries a `sequence` number that only ever grows (the publish time in
+seconds), names the one `APKINDEX.tar.gz` it belongs to by size and SHA-256, and
+lists every package in that index with its size, SHA-256, `protocol_version` and
+`min_core_protocol_version`. The two protocol numbers are read from the manifest
+inside each published APK; an absent minimum means 1. `stable` has the same file
+with an empty package list. `feed.json.sig` is a plain RSA SHA-256 signature
+over the exact bytes of `feed.json`, made with the same key as the index and the
+packages.
+
+A remote fetches both files when it refreshes a repository and uses the index
+only if the signature is good, the channel is the one it asked for, the sequence
+is not lower than the last one it accepted, the metadata has not expired, and
+the index it downloaded hashes to the value in `feed.json`. A package whose
+`min_core_protocol_version` is newer than the remote is shown as "Needs a newer
+Couch" and is never downloaded. A remote that boots with an unset clock skips
+only the expiry check.
+
+`feed.json` is valid for **30 days** and is signed again **every Monday** by the
+scheduled run of `publish.yml`, as well as on every publication. A re-signing
+(`scripts/resign.sh`) builds nothing and needs no admission run: it restores the
+newest release archive, checks that its signed `feed.json` still describes
+exactly the index and packages beside it, and writes a new `feed.json` and
+signature. Every package, index and receipt is republished byte for byte. A full
+publication likewise keeps a channel's index when its package set did not
+change, and refuses to publish a sequence that is not later than the previous
+one. Each re-signing is kept as a `resigned-<sequence>` release holding the
+complete archive (the newest eight are kept), so the next run always knows the
+last published sequence; `feed-<commit>` releases still mark real publications.
+
+> **If publishing stops for 30 days, remotes with a correct clock refuse the
+> official feed until it is signed again.** Installed integrations keep working;
+> browsing, installing and updating packages stop. Three weekly runs can fail
+> before that happens. Things that stop the schedule: GitHub turns a scheduled
+> workflow off after 60 days without repository activity (re-enable it under
+> Actions), a failing run, or a missing `APK_SIGNING_KEY`. To sign again by hand:
+>
+> ```sh
+> gh workflow run publish.yml --repo Couch-OS/couch-integrations --ref main
+> ```
+
+To check the published metadata yourself, with this repository's public key:
+
+```sh
+base=https://packages.couch-os.dev/preview/armv7
+curl -fsSO $base/feed.json -O $base/feed.json.sig -O $base/APKINDEX.tar.gz
+openssl dgst -sha256 -verify keys/couch-integrations.rsa.pub \
+  -signature feed.json.sig feed.json          # prints "Verified OK"
+sha256sum APKINDEX.tar.gz                     # equals .index.sha256 in feed.json
+python3 -m json.tool feed.json
+```
+
 ## CI and release flow
 
 `Feed admission` runs on every pull request, and a pull request run has no
@@ -89,14 +158,16 @@ branch ruleset. It has three layers:
 The unsigned ARM payload is uploaded only as a short-lived review artifact.
 It cannot sign or deploy a feed.
 
-`Publish signed feed` is manually dispatched from `main` only. Its
+`Publish signed feed` runs from `main` only. Its
 `package-signing` environment restricts its `APK_SIGNING_KEY` secret to `main`.
-The workflow requires a successful `Feed admission` run for the exact main
+To publish, the workflow requires a successful `Feed admission` run for the exact main
 commit and downloads that run’s unsigned payload artifact. It does not rebuild
 or execute the integration while the signing key is present. The job
 checks the public/private key match, preserves all previously published APKs,
-re-signs the complete preview index, creates a GitHub Release archive for each feed revision, and uploads the complete site through GitHub's official Pages
-artifact/deployment workflow.
+signs the preview index and each channel's [feed metadata](#feed-metadata),
+creates a GitHub Release archive for each feed revision, and uploads the complete site through GitHub's official Pages
+artifact/deployment workflow. Its weekly scheduled run only signs the feed
+metadata again.
 
 ## Build-time secrets
 
@@ -238,7 +309,7 @@ Materialize the exact source graph, then validate it:
 scripts/checkout_sources.sh ../integration-sources
 python3 scripts/validate_feed.py --sources ../integration-sources
 python3 -m unittest discover -s tests -v
-sh -n scripts/checkout_sources.sh scripts/build_with_secrets.sh scripts/build_artifact.sh scripts/publish.sh
+sh -n scripts/checkout_sources.sh scripts/build_with_secrets.sh scripts/build_artifact.sh scripts/publish.sh scripts/resign.sh
 ```
 
 To build the unsigned payload the way admission does, with no secrets (an
@@ -308,6 +379,11 @@ gh workflow run publish.yml --repo Couch-OS/couch-integrations \
   --ref main -f admission_run_id=SUCCESSFUL_MAIN_ADMISSION_RUN_ID
 ```
 
+The payload artifact of an admission run is kept for 14 days; after that, run
+`Feed admission` on `main` again first (`gh workflow run admission.yml --ref
+main`) and use the new run. Without `admission_run_id` the same command only
+signs the [feed metadata](#feed-metadata) again, which needs no payload.
+
 Merging to `main` is therefore the last human decision before the signing key is
 used. For one more, add required reviewers to the `package-signing` environment
 (Settings → Environments): each signing job then waits for an approval click.
@@ -315,7 +391,9 @@ used. For one more, add required reviewers to the `package-signing` environment
 Require `admission` from GitHub Actions (app ID `15368`) in branch protection,
 with up-to-date branches and administrators included. The signing, build-secret
 (`package-build`) and Pages environments permit `main` only. Repeating publication with the same admitted
-artifact reuses existing APK bytes and regenerates signed indexes. Changed
+artifact reuses existing APK bytes, and reuses each signed index whose package
+set its previous feed metadata already describes; only `feed.json` and its
+signature are new. Changed
 binary or manifest bytes at an existing version require a version bump. A
 retained historical package keeps its original source, SDK, and tooling receipt
 even when a later feed revision advances those pins, or names the same
