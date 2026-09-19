@@ -7,7 +7,7 @@
   "integrations": {
     "denon": {
       "repository": "https://github.com/Couch-OS/couch-integration-denon.git",
-      "commit": "065b6a3d52b2c47616b290016604414e742a4b4b"
+      "commit": "b9ffe91e5be9dc0e7c2c42a84d19bd0bd0d79e8b"
     }
   }
 }
