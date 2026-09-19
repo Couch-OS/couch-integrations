@@ -1,6 +1,10 @@
 #!/bin/sh
 # Sign only a payload built by an approved unprivileged admission run. The
 # protected job never recompiles an integration binary.
+#
+# Every channel also gets signed freshness metadata, feed.json and
+# feed.json.sig (scripts/feed_metadata.py). COUCH_FEED_NOW, whole seconds since
+# the Unix epoch, replaces the clock so a test can publish at a known time.
 set -eu
 
 [ "$#" = 5 ] || { echo "Usage: $0 SOURCES_DIR PRIVATE_KEY PREVIOUS_SITE PAYLOAD_DIR OUTPUT_DIR" >&2; exit 64; }
@@ -37,6 +41,10 @@ python3 "$root/scripts/validate_feed.py" --sources "$sources"
 python3 "$root/scripts/validate_payload.py" $review "$root" "$sources" "$payload"
 [ -f "$key" ] || { echo "private signing key is missing" >&2; exit 1; }
 [ -d "$previous" ] && [ ! -e "$out" ] || { echo "previous site or output is invalid" >&2; exit 1; }
+public_key="$root/keys/couch-integrations.rsa.pub"
+# Refuse a publish time that does not move the feed forward before anything is
+# written: a remote refuses a sequence lower than one it has already seen.
+python3 "$root/scripts/feed_metadata.py" check-sequence --previous "$previous" --public-key "$public_key"
 
 derived=$(mktemp "${TMPDIR:-/tmp}/couch-feed-public.XXXXXX")
 committed=$(mktemp "${TMPDIR:-/tmp}/couch-feed-committed.XXXXXX")
@@ -50,7 +58,7 @@ cmp -s "$derived" "$committed" || {
 
 # Keep host-side output directories owned by the runner. Container-created
 # parent directories would prevent the unprivileged runner moving/cleaning them.
-mkdir -p "$out" "$out/packages" "$out/provenance" "$out/new" \
+mkdir -p "$out" "$out/packages" "$out/stable-packages" "$out/provenance" "$out/new" \
     "$out/repository/armv7" "$out/stable-build/armv7"
 cp -a "$root/feed/." "$out/"
 if [ -d "$previous/preview/armv7" ]; then
@@ -101,17 +109,48 @@ while IFS="$(printf '\t')" read -r integration_id version binary; do
     cp "$artifact_provenance" "$provenance"
 done <"$out/selected.tsv"
 
-docker run --rm --platform linux/arm/v7 \
-    -v "$tooling:/src:ro" -v "$out:/out" \
-    -v "$key:/couch-integrations.rsa:ro" \
-    -v "$root/keys/couch-integrations.rsa.pub:/couch-integrations.rsa.pub:ro" \
-    alpine:3.21 sh -ec '
-        apk add --no-cache alpine-sdk >/dev/null
-        /src/tools/integrations/build-repository.sh /couch-integrations.rsa /out/packages /out/repository
-        mkdir -p /out/stable-build/armv7
-        apk index --rewrite-arch armv7 --output /out/stable-build/armv7/APKINDEX.tar.gz
-        abuild-sign -k /couch-integrations.rsa /out/stable-build/armv7/APKINDEX.tar.gz
-    '
+# An index records when it was made, so building one again changes its bytes.
+# A channel whose package set is exactly the one its previous signed metadata
+# lists keeps its previous index byte for byte; any other channel gets a new one.
+index_is_reusable() {
+    status=0
+    python3 "$root/scripts/feed_metadata.py" reusable-index --previous "$previous" \
+        --public-key "$public_key" --channel "$1" --packages "$2" || status=$?
+    case "$status" in
+        0) return 0 ;;
+        10) return 1 ;;
+        *) exit 1 ;;
+    esac
+}
+build_preview=1
+build_stable=1
+if index_is_reusable preview "$out/packages"; then
+    build_preview=0
+    find "$out/packages" -maxdepth 1 -type f -name '*.apk' -exec cp {} "$out/repository/armv7/" \;
+    cp "$previous/preview/armv7/APKINDEX.tar.gz" "$out/repository/armv7/APKINDEX.tar.gz"
+fi
+# stable-packages stays empty: stable is deliberately an empty signed index.
+if index_is_reusable stable "$out/stable-packages"; then
+    build_stable=0
+    cp "$previous/stable/armv7/APKINDEX.tar.gz" "$out/stable-build/armv7/APKINDEX.tar.gz"
+fi
+if [ "$build_preview$build_stable" != 00 ]; then
+    docker run --rm --platform linux/arm/v7 \
+        -v "$tooling:/src:ro" -v "$out:/out" \
+        -v "$key:/couch-integrations.rsa:ro" \
+        -v "$public_key:/couch-integrations.rsa.pub:ro" \
+        alpine:3.21 sh -ec '
+            apk add --no-cache alpine-sdk >/dev/null
+            if [ "$1" = 1 ]; then
+                /src/tools/integrations/build-repository.sh /couch-integrations.rsa /out/packages /out/repository
+            fi
+            if [ "$2" = 1 ]; then
+                mkdir -p /out/stable-build/armv7
+                apk index --rewrite-arch armv7 --output /out/stable-build/armv7/APKINDEX.tar.gz
+                abuild-sign -k /couch-integrations.rsa /out/stable-build/armv7/APKINDEX.tar.gz
+            fi
+        ' sh "$build_preview" "$build_stable"
+fi
 
 rm -rf "$out/preview/armv7" "$out/stable/armv7"
 mkdir -p "$out/preview" "$out/stable"
@@ -125,5 +164,9 @@ cp "$root/source-pin.json" "$out/stable/SOURCE_PINS.json"
 
 # Pages receives only signed indexes/packages, public keys, provenance receipts,
 # and static landing pages. Never upload unsigned build intermediates.
-rm -rf "$out/packages" "$out/provenance" "$out/new" "$out/payload" \
+rm -rf "$out/packages" "$out/stable-packages" "$out/provenance" "$out/new" "$out/payload" \
     "$out/repository" "$out/stable-build" "$out/source-selected.tsv" "$out/selected.tsv"
+
+# Last, describe and sign exactly the bytes that are about to be deployed.
+python3 "$root/scripts/feed_metadata.py" write --site "$out" --previous "$previous" \
+    --key "$key" --public-key "$public_key"

@@ -8,12 +8,18 @@ on:
     workflows: [Feed admission]
     types: [completed]
     branches: [main]
-  # The manual route stays for republishing a main commit by hand.
+  # feed.json is valid for 30 days. Sign it again every Monday even when
+  # nothing changed, so three missed weeks still leave remotes a valid feed. A
+  # scheduled run only re-signs: it rebuilds nothing and needs no admission run.
+  schedule:
+    - cron: '23 5 * * 1'
+  # The manual route stays for republishing a main commit by hand. Without an
+  # admission run it only re-signs, exactly as the schedule does.
   workflow_dispatch:
     inputs:
       admission_run_id:
-        description: Successful main-branch Feed admission run that built the payload
-        required: true
+        description: Successful main-branch Feed admission run that built the payload. Leave empty to only re-sign the published feed.
+        required: false
         type: string
 
 permissions:
@@ -29,12 +35,14 @@ concurrency:
 jobs:
   decide:
     # No environment and no secrets: only decides whether there is anything to
-    # sign. A merge that touches none of the published inputs (a README, a
-    # test, the admission workflow) must not re-sign the indexes or cut a feed
-    # release. A manual run always publishes.
+    # sign, and how. A merge that touches none of the published inputs (a
+    # README, a test, the admission workflow) must not re-sign the indexes or
+    # cut a feed release. A manual or scheduled run always publishes. "full"
+    # signs an admitted payload; "resign" renews feed.json of the published feed.
     if: >-
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'workflow_dispatch' ||
+       github.event_name == 'schedule' ||
        (github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.event == 'push' &&
         github.event.workflow_run.head_branch == 'main'))
@@ -42,6 +50,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       publish: ${{ steps.decide.outputs.publish }}
+      mode: ${{ steps.decide.outputs.mode }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -49,25 +58,37 @@ jobs:
       - id: decide
         env:
           GH_TOKEN: ${{ github.token }}
-          MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+          EVENT: ${{ github.event_name }}
+          ADMISSION_RUN_ID: ${{ inputs.admission_run_id }}
         run: |
           publish=true
-          if [ "$MANUAL" != true ]; then
-            last=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
-              --json tagName,isDraft,publishedAt \
-              --jq 'map(select(.isDraft == false and (.tagName | startswith("feed-")))) | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
-            last=${last#feed-}
-            # Everything scripts/publish.sh and the payload build read from
-            # this repository. An unknown or unrelated last commit publishes.
-            if [ -n "$last" ] && git merge-base --is-ancestor "$last" HEAD 2>/dev/null &&
-               git diff --quiet "$last" HEAD -- source-pin.json feed-policy.json build-secrets.json feed keys \
-                 scripts/publish.sh scripts/build_artifact.sh scripts/build_with_secrets.sh \
-                 scripts/build_secret_guard.py scripts/checkout_sources.sh; then
-              publish=false
-            fi
+          mode=full
+          if [ "$EVENT" = schedule ] || { [ "$EVENT" = workflow_dispatch ] && [ -z "$ADMISSION_RUN_ID" ]; }; then
+            mode=resign
+          fi
+          last=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isDraft,publishedAt \
+            --jq 'map(select(.isDraft == false and (.tagName | startswith("feed-")))) | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
+          last=${last#feed-}
+          # Everything scripts/publish.sh and the payload build read from
+          # this repository. An unknown or unrelated last commit publishes.
+          unchanged=false
+          if [ -n "$last" ] && git merge-base --is-ancestor "$last" HEAD 2>/dev/null &&
+             git diff --quiet "$last" HEAD -- source-pin.json feed-policy.json build-secrets.json feed keys \
+               scripts/publish.sh scripts/feed_metadata.py scripts/resign.sh \
+               scripts/build_artifact.sh scripts/build_with_secrets.sh \
+               scripts/build_secret_guard.py scripts/checkout_sources.sh; then
+            unchanged=true
+          fi
+          if [ "$EVENT" = workflow_run ] && [ "$unchanged" = true ]; then
+            publish=false
+          fi
+          if [ "$mode" = resign ] && [ "$unchanged" = false ]; then
+            echo "::warning::main has inputs that were never published. This run only re-signs the feed as it was last published; publish main in full with an admission run."
           fi
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
-          echo "publish=$publish"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish mode=$mode"
 
   sign:
     needs: decide
@@ -80,11 +101,13 @@ jobs:
     environment: package-signing
     env:
       ADMISSION_RUN_ID: ${{ inputs.admission_run_id || github.event.workflow_run.id }}
+      MODE: ${{ needs.decide.outputs.mode }}
     steps:
       - uses: actions/checkout@v6
         with:
           path: feed
       - name: Require a successful admission run for this exact main commit
+        if: needs.decide.outputs.mode == 'full'
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ env.ADMISSION_RUN_ID }}
@@ -100,17 +123,20 @@ jobs:
             --jq '.jobs[] | select(.name == "admission") | .conclusion' > "$RUNNER_TEMP/admission-job"
           grep -Fx success "$RUNNER_TEMP/admission-job"
       - uses: actions/download-artifact@v4
+        if: needs.decide.outputs.mode == 'full'
         with:
           name: preview-armv7-payload
           path: ${{ runner.temp }}/payload
           run-id: ${{ env.ADMISSION_RUN_ID }}
           github-token: ${{ github.token }}
       - name: Check out every exact approved source pin
+        if: needs.decide.outputs.mode == 'full'
         working-directory: feed
         run: |
           scripts/checkout_sources.sh ../sources
           python3 scripts/validate_payload.py . ../sources "$RUNNER_TEMP/payload"
       - uses: docker/setup-qemu-action@v3
+        if: needs.decide.outputs.mode == 'full'
         with:
           platforms: arm
       - name: Materialize the protected signing key
@@ -126,10 +152,11 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/previous-site" "$RUNNER_TEMP/release-assets"
           # Each release archive contains the complete retained feed. Restore
-          # the newest one; download errors must not silently discard history.
+          # the newest one, a re-signing included: its feed.json holds the last
+          # published sequence. Download errors must not silently discard history.
           tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
             --json tagName,isDraft,publishedAt \
-            --jq 'map(select(.isDraft == false and (.tagName | startswith("feed-") or startswith("integration-")))) | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
+            --jq 'map(select(.isDraft == false and (.tagName | startswith("feed-") or startswith("resigned-") or startswith("integration-")))) | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
           if [ -n "$tag" ]; then
             gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
               --pattern couch-integrations-preview-armv7.tar.gz \
@@ -138,25 +165,52 @@ jobs:
               "$RUNNER_TEMP/release-assets/couch-integrations-preview-armv7.tar.gz"
           fi
       - name: Build signed indexes from the reviewed payload artifact
+        if: needs.decide.outputs.mode == 'full'
         working-directory: feed
         run: |
           scripts/publish.sh ../sources "$RUNNER_TEMP/couch-integrations.rsa" \
             "$RUNNER_TEMP/previous-site" "$RUNNER_TEMP/payload" "$RUNNER_TEMP/site"
+      - name: Re-sign the published feed without changing a package or an index
+        if: needs.decide.outputs.mode == 'resign'
+        working-directory: feed
+        run: |
+          scripts/resign.sh "$RUNNER_TEMP/couch-integrations.rsa" \
+            "$RUNNER_TEMP/previous-site" "$RUNNER_TEMP/site"
       - name: Archive immutable release assets
         working-directory: feed
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           # A feed revision can add any integration without changing Denon.
-          # Every published revision therefore gets a complete retained archive.
+          # Every published revision therefore gets a complete retained archive,
+          # both channels with their feed.json: the next run reads the last
+          # published sequence from it.
           tag="feed-$GITHUB_SHA"
-          tar -C "$RUNNER_TEMP/site" -czf "$RUNNER_TEMP/couch-integrations-preview-armv7.tar.gz" preview
-          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          tar -C "$RUNNER_TEMP/site" -czf "$RUNNER_TEMP/couch-integrations-preview-armv7.tar.gz" preview stable
+          if [ "$MODE" = full ] && ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP/couch-integrations-preview-armv7.tar.gz" \
               "$RUNNER_TEMP/site/preview/armv7/APKINDEX.tar.gz" \
               "$RUNNER_TEMP/site/preview/armv7/"*.apk \
               --target "$GITHUB_SHA" --title "Couch integration feed ${GITHUB_SHA:0:12}" \
               --notes "Signed ARMv7 preview feed built from independently pinned integration sources."
+          else
+            # A re-signing, or a second publication of a commit that already
+            # has its feed release, changes no package. "feed-<commit>" keeps
+            # meaning "the published inputs as of that commit" for the decide
+            # job, so this archive gets a tag of its own, named by sequence.
+            sequence=$(jq -er .sequence "$RUNNER_TEMP/site/preview/armv7/feed.json")
+            issued=$(jq -er .issued "$RUNNER_TEMP/site/preview/armv7/feed.json")
+            gh release create "resigned-$sequence" --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP/couch-integrations-preview-armv7.tar.gz" \
+              --target "$GITHUB_SHA" --latest=false --title "Couch integration feed re-signed $issued" \
+              --notes "The same packages and indexes as the feed release before it, with feed.json signed again. Valid for 30 days from $issued."
+            # Eight weeks of re-signed archives are plenty; each holds every
+            # package. Tidying up must never stop the deployment that follows.
+            stale=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,publishedAt \
+              --jq 'map(select(.tagName | startswith("resigned-"))) | sort_by(.publishedAt) | reverse | .[8:][].tagName') || stale=
+            for old in $stale; do
+              gh release delete "$old" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes ||
+                echo "::warning::could not remove the old re-signed release $old"
+            done
           fi
       - name: Remove the ephemeral private key
         if: always()
