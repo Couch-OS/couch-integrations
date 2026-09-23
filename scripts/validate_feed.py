@@ -22,10 +22,8 @@ REPOSITORY = re.compile(
     )
 )
 CORE_REPOSITORIES = frozenset(f"https://github.com/{owner}/couch.git" for owner in OWNERS)
-# The plugin protocol versions a released Couch core speaks
-# (clients/couch-plugin PROTOCOL_VERSION). Version 2 first shipped in
-# v0.1.0-alpha.20260918.177.
-PROTOCOL_VERSIONS = frozenset({1, 2})
+# The plugin protocol versions a released Couch core speaks.
+PROTOCOL_VERSIONS = frozenset({1, 2, 3})
 RECEIPT_FIELDS = frozenset({
     "schema", "source_repository", "source_commit", "sdk_repository",
     "sdk_commit", "tooling_repository", "tooling_commit", "id", "version",
@@ -48,6 +46,9 @@ REQUIRED_ADMISSION_CALLS = {
     "failure": "testing::failure(",
     "timeout_no_retry": "testing::timeout_no_retry(",
     "spike": "testing::spike(",
+    "concurrent_package_startup_is_offline_and_race_free": "testing::Package::new(",
+}
+CONCURRENT_ADMISSION = {
     "concurrent_package_startup_is_offline_and_race_free": "testing::Package::new(",
 }
 
@@ -310,11 +311,23 @@ def validate_integration(source: Path, integration_id: str, pin: dict) -> dict:
         raise InvalidFeed(f"{integration_id} Cargo package does not match integration.json")
     if cargo_config.get("target", {}).get("armv7-unknown-linux-musleabihf", {}).get("linker") != "rust-lld":
         raise InvalidFeed(f"{integration_id} must use rust-lld for the ARMv7 target")
+    manifest = load_json(manifest_path)
     admission = admission_path.read_text(encoding="utf-8")
-    for case, harness_call in REQUIRED_ADMISSION_CALLS.items():
+    required = CONCURRENT_ADMISSION
+    if metadata["protocol_version"] < 3:
+        required = REQUIRED_ADMISSION_CALLS
+    for case, harness_call in required.items():
         declaration = re.compile(rf"#\[test\]\s*fn\s+{re.escape(case)}\s*\(")
         if not declaration.search(admission) or harness_call not in admission:
             raise InvalidFeed(f"{integration_id} admission must reuse the shared {case} case")
+    if metadata["protocol_version"] == 3:
+        tests = "\n".join(
+            path.read_text(encoding="utf-8") for path in sorted((source / "tests").glob("*.rs"))
+        )
+        if manifest.get("children") and "testing_v3::children(" not in tests:
+            raise InvalidFeed(f"{integration_id} admission must reuse the shared children case")
+        if manifest.get("pairing") and "testing_v3::pairing(" not in tests:
+            raise InvalidFeed(f"{integration_id} admission must reuse the shared pairing case")
     dependencies = {
         dependency_pin(cargo.get(table, {}).get(name), f"{integration_id} {prefix}{name}")
         for table, prefix in (("dependencies", ""), ("dev-dependencies", "dev "))
@@ -329,7 +342,6 @@ def validate_integration(source: Path, integration_id: str, pin: dict) -> dict:
         raise InvalidFeed(f"{integration_id} SDK dependencies do not share one Couch repository URL")
     metadata = dict(metadata)
     metadata["sdk_commit"] = revisions.pop()
-    manifest = load_json(manifest_path)
     if (
         manifest.get("protocol_version") != metadata["protocol_version"]
         # The core refuses a manifest whose minimum core protocol differs from

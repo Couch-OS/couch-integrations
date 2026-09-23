@@ -2,12 +2,16 @@
   "schema": 2,
   "tooling": {
     "repository": "https://github.com/Couch-OS/couch.git",
-    "commit": "00ab4da2e6336a925e93702507c0b7b233012738"
+    "commit": "f943d4063efd95b50cb1141a513bc4d6c87b857a"
   },
   "integrations": {
     "denon": {
       "repository": "https://github.com/Couch-OS/couch-integration-denon.git",
       "commit": "8d3081353188916d575dccd36582b460b9b190c6"
+    },
+    "hue": {
+      "repository": "https://github.com/Couch-OS/couch-integration-hue.git",
+      "commit": "5334990a87899c35d2d84562805a91e9ab209bb9"
     },
     "kodi": {
       "repository": "https://github.com/Couch-OS/couch-integration-kodi.git",

@@ -2,7 +2,7 @@
   "schema": 1,
   "channels": {
     "preview": {
-      "ids": ["denon", "kodi", "sonos"],
+      "ids": ["denon", "hue", "kodi", "sonos"],
       "allowed_tiers": ["preview"]
     },
     "stable": {
