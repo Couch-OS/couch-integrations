@@ -9,6 +9,10 @@
       "repository": "https://github.com/Couch-OS/couch-integration-denon.git",
       "commit": "8d3081353188916d575dccd36582b460b9b190c6"
     },
+    "hue": {
+      "repository": "https://github.com/Couch-OS/couch-integration-hue.git",
+      "commit": "5334990a87899c35d2d84562805a91e9ab209bb9"
+    },
     "kodi": {
       "repository": "https://github.com/Couch-OS/couch-integration-kodi.git",
       "commit": "a49439668759772ba2181805b44d3e0e2f0dfd8a"

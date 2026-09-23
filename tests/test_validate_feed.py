@@ -126,10 +126,15 @@ couch-sdk = {{ git = "{core}", rev = "{revision}" }}
         )
         admission = denon / "tests/admission.rs"
         admission.parent.mkdir(parents=True, exist_ok=True)
+        required = (
+            feed.CONCURRENT_ADMISSION
+            if metadata["protocol_version"] == 3
+            else feed.REQUIRED_ADMISSION_CALLS
+        )
         admission.write_text(
             "\n".join(
                 f"#[test]\nfn {case}() {{ {call} fixture); }}"
-                for case, call in feed.REQUIRED_ADMISSION_CALLS.items()
+                for case, call in required.items()
             ),
             encoding="utf-8",
         )
@@ -257,9 +262,26 @@ couch-sdk = {{ git = "{LEGACY_CORE}", rev = "{revision}" }}
             metadata_changes={"protocol_version": 2}, manifest_changes=v2))
         self.assertEqual(selected["denon"]["manifest_data"]["protocol_version"], 2)
 
+    def test_a_protocol_v3_package_reuses_children_pairing_and_concurrent_admission(self):
+        v3 = {
+            "protocol_version": 3,
+            "min_core_protocol_version": 3,
+            "children": [{"kind": "light"}],
+            "pairing": {"required": True, "max_seconds": 120},
+        }
+        sources = self.write_sources(
+            metadata_changes={"protocol_version": 3}, manifest_changes=v3)
+        tests = sources / "integrations/denon/tests"
+        (tests / "protocol3.rs").write_text(
+            "testing_v3::children(fixture); testing_v3::pairing(fixture);",
+            encoding="utf-8",
+        )
+        selected = self.validate(sources)
+        self.assertEqual(selected["denon"]["manifest_data"]["protocol_version"], 3)
+
     def test_protocol_versions_must_be_known_and_agree(self):
         for metadata, manifest, message in (
-            ({"protocol_version": 3}, {"protocol_version": 3, "min_core_protocol_version": 3}, "source metadata is invalid"),
+            ({"protocol_version": 4}, {"protocol_version": 4, "min_core_protocol_version": 4}, "source metadata is invalid"),
             ({"protocol_version": 0}, {"protocol_version": 0}, "source metadata is invalid"),
             ({"protocol_version": True}, {}, "source metadata is invalid"),
             ({"protocol_version": "2"}, {"protocol_version": 2, "min_core_protocol_version": 2}, "source metadata is invalid"),
