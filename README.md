@@ -25,8 +25,9 @@ name, so a pin must not rely on that redirect. This feed repository moved on
 
 ## Channels
 
-`preview` currently publishes the Denon, Kodi and Sonos integrations. Synthetic or
-`test-only` sources are rejected even if a policy tries to select them.
+`preview` currently publishes the Denon, Hue, Kodi, Sonos and LG webOS
+integrations. Synthetic or `test-only` sources are rejected even if a policy
+tries to select them.
 
 `stable` is deliberately an empty signed index. It contains no integration
 packages until a production-tier integration has validated hardware evidence.

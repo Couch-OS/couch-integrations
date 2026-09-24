@@ -20,6 +20,10 @@
     "sonos": {
       "repository": "https://github.com/Couch-OS/couch-integration-sonos.git",
       "commit": "fb763ff240dbf47e8bd5c03dfed73f9a0f0ab40f"
+    },
+    "webos": {
+      "repository": "https://github.com/Couch-OS/couch-integration-webos.git",
+      "commit": "ae27507b83c91dab9e54ff28703ce2c52f1fcf65"
     }
   }
 }
