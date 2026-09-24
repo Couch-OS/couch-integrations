@@ -22,8 +22,9 @@ REPOSITORY = re.compile(
     )
 )
 CORE_REPOSITORIES = frozenset(f"https://github.com/{owner}/couch.git" for owner in OWNERS)
-# The plugin protocol versions a released Couch core speaks.
-PROTOCOL_VERSIONS = frozenset({1, 2, 3})
+# The plugin protocol versions the pinned tooling host admits. Protocol 4 is
+# built through its explicit preview feature until the OS enables it normally.
+PROTOCOL_VERSIONS = frozenset({1, 2, 3, 4})
 RECEIPT_FIELDS = frozenset({
     "schema", "source_repository", "source_commit", "sdk_repository",
     "sdk_commit", "tooling_repository", "tooling_commit", "id", "version",

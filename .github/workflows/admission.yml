@@ -48,6 +48,7 @@ jobs:
         working-directory: sources/tooling
         run: |
           cargo test --locked --manifest-path clients/Cargo.toml -p couch-plugin --test protocol
+          cargo test --locked --manifest-path clients/Cargo.toml -p couch-plugin --test protocol --features protocol-4-preview
           python3 tools/integrations/validate_catalog.py
           python3 -m unittest tools.integrations.test_validate_catalog -v
           cargo test --locked --manifest-path daemon/Cargo.toml -p couch-integrations
@@ -147,7 +148,8 @@ jobs:
           tools/fetch-zig.sh
           . tools/arm-cc-env.sh
           cd daemon
-          cargo build --locked --release --target armv7-unknown-linux-musleabihf -p couch-confd
+          cargo build --locked --release --target armv7-unknown-linux-musleabihf \
+            -p couch-confd --features protocol-4-preview
       - name: Sign twice with a disposable key and verify immutable output
         working-directory: feed
         run: scripts/test_publish.sh "$PWD" ../sources "$RUNNER_TEMP/payload"
