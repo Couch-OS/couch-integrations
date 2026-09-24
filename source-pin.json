@@ -23,7 +23,7 @@
     },
     "webos": {
       "repository": "https://github.com/Couch-OS/couch-integration-webos.git",
-      "commit": "ae27507b83c91dab9e54ff28703ce2c52f1fcf65"
+      "commit": "6a0ccef89b4e19606c5a77e88b02edfe7d78ee45"
     }
   }
 }
