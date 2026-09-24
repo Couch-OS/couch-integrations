@@ -2,7 +2,7 @@
   "schema": 2,
   "tooling": {
     "repository": "https://github.com/Couch-OS/couch.git",
-    "commit": "031f9fa184ea722e1972dfcda093a4f844b3fb1a"
+    "commit": "382731080a15181426b75adf615da2753dd143aa"
   },
   "integrations": {
     "denon": {
@@ -23,7 +23,7 @@
     },
     "unifi-protect": {
       "repository": "https://github.com/Couch-OS/couch-integration-unifi-protect.git",
-      "commit": "3981cb9998acf6948be40ea49862104adb41c631"
+      "commit": "0e62bf18375b715dde9126443d00914e537024c5"
     },
     "webos": {
       "repository": "https://github.com/Couch-OS/couch-integration-webos.git",
