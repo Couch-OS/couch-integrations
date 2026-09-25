@@ -2,7 +2,7 @@
   "schema": 2,
   "tooling": {
     "repository": "https://github.com/Couch-OS/couch.git",
-    "commit": "382731080a15181426b75adf615da2753dd143aa"
+    "commit": "77a84d8380ea11a4cd1ad48b377b5ed040347a44"
   },
   "integrations": {
     "denon": {
@@ -27,7 +27,7 @@
     },
     "webos": {
       "repository": "https://github.com/Couch-OS/couch-integration-webos.git",
-      "commit": "c4ac91c1eb0777cf7f01670dbca2715d62cf443c"
+      "commit": "5560f66538a9d41e84ba33aa125a3aa55b4cad37"
     }
   }
 }
