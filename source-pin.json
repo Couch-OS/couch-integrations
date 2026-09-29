@@ -21,6 +21,10 @@
       "repository": "https://github.com/Couch-OS/couch-integration-sonos.git",
       "commit": "fb763ff240dbf47e8bd5c03dfed73f9a0f0ab40f"
     },
+    "twinkly": {
+      "repository": "https://github.com/Couch-OS/couch-integration-twinkly.git",
+      "commit": "70599bb024ed81a60240de46529e471a5366c742"
+    },
     "unifi-protect": {
       "repository": "https://github.com/Couch-OS/couch-integration-unifi-protect.git",
       "commit": "0e62bf18375b715dde9126443d00914e537024c5"
